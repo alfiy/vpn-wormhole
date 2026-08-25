@@ -60,15 +60,19 @@
 
         <!-- Files -->
         <div class="file-panel">
-          <h3>文件传输</h3>
-          <div class="file-actions">
-            <label class="btn secondary file-label">
-              选择文件发送
-              <input type="file" id="file-input" multiple hidden />
-            </label>
+          <div class="file-panel-header">
+            <h3>文件传输</h3>
+            <div class="file-actions">
+              <label class="btn secondary file-label">
+                选择文件发送
+                <input type="file" id="file-input" multiple hidden />
+              </label>
+            </div>
           </div>
-          <div id="file-progress" class="progress-list"></div>
-          <div id="received-files" class="received-list"></div>
+          <div class="file-scroll">
+            <div id="file-progress" class="progress-list"></div>
+            <div id="received-files" class="received-list"></div>
+          </div>
         </div>
       </div>
 
