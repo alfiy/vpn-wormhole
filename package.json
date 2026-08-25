@@ -1,0 +1,18 @@
+{
+  "name": "vpn-wormhole",
+  "version": "1.0.0",
+  "description": "B/S encrypted file transfer & chat similar to Magic-Wormhole, optimized for VPN networks",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/crypto-test.js"
+  },
+  "keywords": ["wormhole", "webrtc", "e2e", "vpn", "file-transfer", "chat"],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

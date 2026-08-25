@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VPN-Wormhole · 加密传输与对话</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>VPN-Wormhole</h1>
+      <p class="subtitle">类似 Magic-Wormhole 的端到端加密文件传输与对话 · 专为 VPN 场景优化</p>
+    </header>
+
+    <!-- Step 1: Create / Join -->
+    <section id="lobby" class="card">
+      <div class="tabs">
+        <button class="tab active" data-tab="create">创建房间</button>
+        <button class="tab" data-tab="join">加入房间</button>
+      </div>
+
+      <div id="create-panel" class="panel active">
+        <p>点击下方按钮生成短码，把短码安全地告诉对方（电话 / 短信 / 当面）。</p>
+        <button id="btn-create" class="btn primary">生成房间码</button>
+        <div id="code-display" class="code-box hidden">
+          <span id="room-code"></span>
+          <button id="btn-copy" class="btn small">复制</button>
+        </div>
+        <p id="create-status" class="status"></p>
+      </div>
+
+      <div id="join-panel" class="panel">
+        <p>输入对方给你的房间码：</p>
+        <input id="join-code" type="text" placeholder="例如 7-apple-river" autocomplete="off" />
+        <button id="btn-join" class="btn primary">加入</button>
+        <p id="join-status" class="status"></p>
+      </div>
+    </section>
+
+    <!-- Step 2: Connected session -->
+    <section id="session" class="card hidden">
+      <div class="session-header">
+        <div>
+          <strong>房间码：</strong><span id="session-code"></span>
+          <span id="conn-status" class="badge">连接中…</span>
+        </div>
+        <button id="btn-leave" class="btn danger small">离开房间</button>
+      </div>
+
+      <div class="main-grid">
+        <!-- Chat -->
+        <div class="chat-panel">
+          <div id="chat-log" class="chat-log"></div>
+          <div class="chat-input-row">
+            <input id="chat-input" type="text" placeholder="输入消息…" disabled />
+            <button id="btn-send" class="btn primary" disabled>发送</button>
+          </div>
+        </div>
+
+        <!-- Files -->
+        <div class="file-panel">
+          <h3>文件传输</h3>
+          <div class="file-actions">
+            <label class="btn secondary file-label">
+              选择文件发送
+              <input type="file" id="file-input" multiple hidden />
+            </label>
+          </div>
+          <div id="file-progress" class="progress-list"></div>
+          <div id="received-files" class="received-list"></div>
+        </div>
+      </div>
+
+      <div class="tech-info">
+        <small>
+          传输通道：<span id="channel-type">—</span> ·
+          加密：AES-256-GCM (从短码派生) ·
+          WebRTC 状态：<span id="webrtc-state">—</span>
+        </small>
+      </div>
+    </section>
+
+    <footer>
+      <p>短码请通过安全渠道传递。服务器看不到明文内容。房间 30 分钟后自动过期。</p>
+    </footer>
+  </div>
+
+  
+  <script src="app.js"></script>
+</body>
+</html>
