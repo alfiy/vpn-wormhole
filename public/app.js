@@ -777,4 +777,18 @@
     cleanupPeer();
     location.reload();
   });
+
+  // 从服务端读取房间过期时间，显示在页脚
+  (async () => {
+    const el = document.getElementById('room-ttl-text');
+    if (!el) return;
+    try {
+      const res = await fetch('/api/config');
+      const cfg = await res.json();
+      const m = cfg.roomTtlMinutes || 30;
+      el.textContent = m >= 60 && m % 60 === 0 ? `${m / 60} 小时` : `${m} 分钟`;
+    } catch (_) {
+      el.textContent = '30 分钟';
+    }
+  })();
 })();

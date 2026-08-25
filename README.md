@@ -19,6 +19,16 @@
 cd vpn-wormhole
 npm install          # 仅安装 ws
 npm start            # 默认监听 0.0.0.0:3080
+
+# 5 分钟过期
+ROOM_TTL_MINUTES=5 npm start
+
+# 10 分钟过期
+ROOM_TTL_MINUTES=10 npm start
+
+# 60 分钟过期
+ROOM_TTL_MINUTES=60 npm start
+
 ```
 
 访问：

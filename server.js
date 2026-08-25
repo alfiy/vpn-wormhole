@@ -14,7 +14,9 @@ const { execSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3080;
-const ROOM_TTL_MS = 30 * 60 * 1000;
+// 房间过期时间（分钟）。部署时设置，例如：ROOM_TTL_MINUTES=5 npm start
+const ROOM_TTL_MINUTES = Math.max(1, parseInt(process.env.ROOM_TTL_MINUTES || '30', 10) || 30);
+const ROOM_TTL_MS = ROOM_TTL_MINUTES * 60 * 1000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CERT_DIR = path.join(__dirname, 'certs');
 const KEY_FILE = path.join(CERT_DIR, 'key.pem');
@@ -156,24 +158,29 @@ function createAppHandler() {
       return;
     }
 
-    if (req.url.startsWith('/api/health')) {
+    if (req.url.startsWith('/api/health') || req.url.startsWith('/api/config')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
         secure: req.socket.encrypted === true,
         rooms: rooms.size,
-        uptime: Math.floor(process.uptime())
+        uptime: Math.floor(process.uptime()),
+        roomTtlMinutes: ROOM_TTL_MINUTES,
+        roomTtlMs: ROOM_TTL_MS
       }));
       return;
     }
 
     if (req.url.startsWith('/api/rooms')) {
       const list = [];
+      const now = Date.now();
       for (const [code, room] of rooms) {
+        const ageSec = Math.floor((now - room.createdAt) / 1000);
         list.push({
           code,
           members: room.clients.size,
-          ageSec: Math.floor((Date.now() - room.createdAt) / 1000)
+          ageSec,
+          remainSec: Math.max(0, Math.floor((ROOM_TTL_MS - (now - room.createdAt)) / 1000))
         });
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -311,6 +318,7 @@ httpsServer.listen(PORT, '0.0.0.0', () => {
   console.log('────────────────────────────────────────');
   console.log(`  本机访问:     https://127.0.0.1:${PORT}`);
   console.log(`  局域网访问:   https://<服务器IP>:${PORT}`);
+  console.log(`  房间过期:     ${ROOM_TTL_MINUTES} 分钟  (环境变量 ROOM_TTL_MINUTES)`);
   console.log('');
   console.log('  首次用 IP 访问时浏览器会提示「证书不受信任」：');
   console.log('  点击「高级」→「继续访问」即可（自签名证书，仅内网使用）。');
