@@ -249,7 +249,8 @@ function attachWebSocket(server) {
         }
 
         case 'signal':
-        case 'relay-data': {
+        case 'relay-data':
+        case 'pake': {
           const code = ws.roomCode;
           if (!code) return;
           const room = rooms.get(code);

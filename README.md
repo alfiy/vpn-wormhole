@@ -1,69 +1,75 @@
 # VPN-Wormhole
 
-类似 Magic-Wormhole 的 **B/S 架构** 端到端加密文件传输 + 实时对话模块，专为 **OpenVPN 等私有网络** 场景优化。
+类似 Magic-Wormhole 的 **B/S 端到端加密** 文件传输 + 实时对话模块，面向 OpenVPN / 局域网场景。
 
-两个用户先通过 OpenVPN 客户端接入同一 VPN，然后在浏览器中打开本服务，用短码配对后即可安全聊天和传文件。
+一台服务器部署本服务，其他终端浏览器打开 `https://服务器IP:3080` 即可创建/加入房间，完成加密聊天与文件传输。
 
-## 特性
+## 为什么必须是 HTTPS？
 
-- **无账号**：短码（如 `7-apple-river`）配对
-- **端到端加密**：AES-256-GCM，密钥由短码通过 PBKDF2（21 万次迭代）派生，服务器看不到明文
-- **优先 WebRTC P2P**：VPN 内网直连成功率高；失败时自动 fallback 到服务器加密中继
-- **实时聊天 + 分块文件传输**：多文件、进度条、SHA-256 完整性校验
-- **房间自动过期**：默认 30 分钟
-- **依赖极简**：仅需一个轻量 `ws` 包
+浏览器规定：只有 **HTTPS**（或 localhost）下才能使用 Web Crypto API（`crypto.subtle`）。  
+因此本服务**默认启用 HTTPS**，并在首次启动时自动生成自签名证书。
 
 ## 快速开始
 
 ```bash
 cd vpn-wormhole
-npm install          # 仅安装 ws
-npm start            # 默认监听 0.0.0.0:3080
-
-# 5 分钟过期
-ROOM_TTL_MINUTES=5 npm start
-
-# 10 分钟过期
-ROOM_TTL_MINUTES=10 npm start
-
-# 60 分钟过期
-ROOM_TTL_MINUTES=60 npm start
-
+npm install          # 仅依赖 ws
+npm start            # 默认 https://0.0.0.0:3080 ，房间 30 分钟过期
 ```
 
-访问：
-- 本机：http://localhost:3080
-- VPN 内网：http://你的VPN内网IP:3080
+自定义房间过期时间（单位：分钟）：
 
-### 使用流程
+```bash
+ROOM_TTL_MINUTES=5 npm start     # 5 分钟
+ROOM_TTL_MINUTES=10 npm start    # 10 分钟
+ROOM_TTL_MINUTES=60 npm start    # 60 分钟
+```
 
-1. 用户 A 点击「生成房间码」，得到类似 `7-apple-river` 的短码
-2. **通过电话 / 短信 / 当面等安全渠道**把短码告诉用户 B
-3. 用户 B 输入短码加入
-4. 双方建立加密通道后即可聊天或选择文件发送
-5. 文件在接收端自动校验并提供下载链接
+也可在 systemd / Docker 里用环境变量 `ROOM_TTL_MINUTES` 配置。  
+启动后终端会打印当前过期时间与访问地址。
 
-## 安全说明
+### 客户端怎么用
 
-| 项目 | 说明 |
-|------|------|
-| 密钥派生 | PBKDF2-SHA256，固定盐 + 21 万次迭代 |
-| 传输加密 | 聊天与文件均使用 AES-GCM（随机 IV） |
-| 服务器角色 | 仅做信令转发与可选中继，无法解密内容 |
-| 短码保护 | 短码是唯一共享秘密，务必安全传递；房间短时有效 |
+1. 在任意一台能访问服务器的机器上，浏览器打开：  
+   **`https://服务器IP:3080`**
+2. 浏览器提示「证书不受信任 / 连接不是私密连接」：  
+   - Chrome：点击「高级」→「继续前往 xxx（不安全）」  
+   - Firefox：点「高级」→「接受风险并继续」
+3. 之后即可正常「生成房间码 / 加入房间」，端到端加密可用。
 
-当前使用强 PBKDF2 而非完整 SPAKE2/CPace。后续可替换为真正的 PAKE。
+> 同一台机器也可以用 `https://127.0.0.1:3080`。
+
+可选：`http://服务器IP:3081` 会显示一个提示页，引导你改用 HTTPS。
+
+## 功能
+
+- 无账号短码配对（如 `7-apple-river`）
+- **SPAKE2 PAKE** + AES-256-GCM 端到端加密（短码用于口令认证密钥交换，抗离线字典攻击）
+- 优先 WebRTC P2P，失败自动切加密中继
+- 实时聊天 + 分块文件传输 + SHA-256 校验
+- 房间自动过期（默认 30 分钟，可用环境变量 `ROOM_TTL_MINUTES` 配置），仅支持两人
+
+## 证书说明
+
+首次启动会在 `certs/` 目录生成：
+
+- `key.pem`
+- `cert.pem`
+
+自签名证书仅用于内网/VPN，有效期约 2 年。  
+如需重新生成，删除 `certs/` 目录后重启服务即可。
 
 ## 目录结构
 
 ```
 vpn-wormhole/
 ├── package.json
-├── server.js          # 纯 Node + ws 信令服务器
+├── server.js          # HTTPS 信令服务器（自动生成证书）
+├── certs/             # 自签名证书（自动生成）
 ├── public/
 │   ├── index.html
 │   ├── style.css
-│   └── app.js         # 前端（WebRTC + 加密 + UI）
+│   └── app.js
 ├── test/
 │   └── crypto-test.js
 └── README.md
@@ -72,18 +78,23 @@ vpn-wormhole/
 ## 测试
 
 ```bash
-npm test   # 密钥派生与加解密单元测试
+npm test
 ```
-
-手动测试：两个浏览器标签页（或两台已连同一 VPN 的设备）分别创建/加入同一房间码。
-
-## 部署建议（OpenVPN）
-
-1. 将服务运行在 VPN 服务器或同一网段机器上
-2. 可选用 systemd / Docker 守护
-3. VPN 内网可用 HTTP；若暴露公网请加 HTTPS
-4. 防火墙最好只允许 VPN 网段访问 3080
 
 ## License
 
 MIT
+
+
+## 安全模型（SPAKE2）
+
+两端共享房间短码后，通过 **SPAKE2**（RFC 9382 风格，2048-bit MODP 群）协商会话密钥：
+
+1. 创建方为 SPAKE2 角色 A，加入方为角色 B  
+2. 各生成一轮 PAKE 消息，经服务器**明文转发**（服务器无法从中算出会话密钥）  
+3. 双方得到相同的高熵密钥材料，再经 HKDF 得到 AES-256-GCM 密钥  
+4. 之后聊天 / 文件 / WebRTC 信令均使用该密钥加密  
+
+相比「短码 → PBKDF2 → 密钥」，被动窃听者无法对密文做高效离线穷举短码；主动攻击者每次只能在线尝试一次。
+
+实现见 `public/spake2.js`（纯 JS/BigInt，无额外 npm 依赖）。

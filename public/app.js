@@ -64,30 +64,16 @@
   ];
   let relayReady = false;
 
-  async function deriveKey(code) {
-    const enc = new TextEncoder();
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw', enc.encode(code), 'PBKDF2', false, ['deriveKey']
-    );
-    // 10 万次迭代：在普通设备上约 100–300ms，安全强度足够短码场景
-    return crypto.subtle.deriveKey(
-      {
-        name: 'PBKDF2',
-        salt: enc.encode('vpn-wormhole-v1-salt'),
-        iterations: 100000,
-        hash: 'SHA-256'
-      },
-      keyMaterial,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-  }
-
-  // 等待密钥就绪（避免 peer-joined / signal 在密钥派生完成前到达）
+  // ---------- SPAKE2 PAKE ----------
+  // 真正的口令认证密钥交换：短码仅用于 PAKE，会话密钥由协商产生（抗离线字典）
   let keyReadyResolve = null;
-  const keyReady = new Promise((resolve) => { keyReadyResolve = resolve; });
+  let keyReady = new Promise((resolve) => { keyReadyResolve = resolve; });
+  let pakeDone = false;
+  let pendingPakeMsg = null; // 若 peer 的 pake 消息先到，先缓存
+  let spakeInstance = null;
+
   function markKeyReady() {
+    pakeDone = true;
     if (keyReadyResolve) {
       keyReadyResolve();
       keyReadyResolve = null;
@@ -96,6 +82,62 @@
   async function waitForKey() {
     if (cryptoKey) return;
     await keyReady;
+  }
+
+  function resetKeyReady() {
+    pakeDone = false;
+    cryptoKey = null;
+    pendingPakeMsg = null;
+    spakeInstance = null;
+    keyReady = new Promise((resolve) => { keyReadyResolve = resolve; });
+  }
+
+  async function runPAKE() {
+    if (cryptoKey) return;
+    if (typeof SPAKE2 === 'undefined') {
+      throw new Error('SPAKE2 库未加载');
+    }
+    const side = isCreator ? 'A' : 'B';
+    console.log('[pake] start SPAKE2 side=', side);
+    setConnStatus('正在进行 SPAKE2 密钥协商…');
+    spakeInstance = SPAKE2.create(roomCode, side);
+    const myMsg = await spakeInstance.start();
+    const b64 = SPAKE2.bytesToBase64(myMsg);
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'pake', data: b64 }));
+    }
+
+    // 等待对端 pake 消息
+    const peerB64 = await new Promise((resolve, reject) => {
+      if (pendingPakeMsg) {
+        const m = pendingPakeMsg;
+        pendingPakeMsg = null;
+        resolve(m);
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error('SPAKE2 协商超时')), 15000);
+      window.__pakeWait = (data) => {
+        clearTimeout(timer);
+        window.__pakeWait = null;
+        resolve(data);
+      };
+    });
+
+    const peerMsg = SPAKE2.base64ToBytes(peerB64);
+    const keyMaterial = await spakeInstance.finish(peerMsg);
+    cryptoKey = await SPAKE2.keyMaterialToAesGcm(keyMaterial);
+    markKeyReady();
+    console.log('[pake] SPAKE2 complete, AES key ready');
+    setConnStatus('密钥协商完成，正在建立通道…');
+    addChat('✅ SPAKE2 密钥协商成功，通信已端到端加密。', false);
+  }
+
+  async function onPakeMessage(data) {
+    if (window.__pakeWait) {
+      window.__pakeWait(data);
+    } else {
+      pendingPakeMsg = data;
+    }
   }
 
   // 大块二进制安全转 base64（避免 String.fromCharCode(...大数组) 爆栈）
@@ -280,11 +322,20 @@
         joinStatus.className = 'status error';
         break;
       case 'peer-joined':
-        // 必须等密钥就绪，否则后续加密信令会失败
-        await waitForKey();
-        setConnStatus('对端已加入，正在建立安全通道…');
-        addChat('对方已进入房间，正在协商加密通道…', false);
-        await startWebRTC();
+        setConnStatus('对端已加入，正在协商密钥…');
+        addChat('对方已进入房间，开始 SPAKE2 密钥协商…', false);
+        try {
+          await runPAKE();
+          await startWebRTC();
+        } catch (e) {
+          console.error('[pake] failed', e);
+          setConnStatus('密钥协商失败', 'failed');
+          addChat('密钥协商失败：' + (e.message || e), false);
+        }
+        break;
+      case 'pake':
+        // 对端 SPAKE2 消息（明文经服务器转发，不含最终密钥）
+        if (msg.data) await onPakeMessage(msg.data);
         break;
       case 'peer-left':
         setConnStatus('对方已离开', 'failed');
@@ -674,13 +725,11 @@
 
       roomCode = msg.code;
       isCreator = true;
-      createStatus.textContent = '正在派生加密密钥…';
-      cryptoKey = await deriveKey(roomCode);
-      markKeyReady();
+      resetKeyReady();
 
       roomCodeEl.textContent = roomCode;
       codeDisplay.classList.remove('hidden');
-      createStatus.textContent = '房间已创建，等待对方加入…';
+      createStatus.textContent = '房间已创建，等待对方加入后进行 SPAKE2 协商…';
       createStatus.className = 'status ok';
       showSession(roomCode);
       setConnStatus('等待对方加入…');
@@ -724,11 +773,9 @@
     joinStatus.textContent = '正在派生加密密钥…';
     joinStatus.className = 'status';
     try {
-      // 加入方在发 join 之前就知道房间码，先派生密钥，避免 peer-joined / signal 抢跑
       isCreator = false;
       roomCode = code;
-      cryptoKey = await deriveKey(code);
-      markKeyReady();
+      resetKeyReady();
 
       joinStatus.textContent = '正在加入…';
       await connectWS();
