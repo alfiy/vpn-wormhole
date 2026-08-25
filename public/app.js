@@ -56,21 +56,25 @@
   let pendingJoin = null;
 
   const CHUNK_SIZE = 32 * 1024;
+  // 局域网/VPN 下 host 候选通常最可靠；公网 STUN 作为补充
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' }
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' }
   ];
+  let relayReady = false;
 
   async function deriveKey(code) {
     const enc = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
       'raw', enc.encode(code), 'PBKDF2', false, ['deriveKey']
     );
+    // 10 万次迭代：在普通设备上约 100–300ms，安全强度足够短码场景
     return crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
         salt: enc.encode('vpn-wormhole-v1-salt'),
-        iterations: 210000,
+        iterations: 100000,
         hash: 'SHA-256'
       },
       keyMaterial,
@@ -80,19 +84,49 @@
     );
   }
 
+  // 等待密钥就绪（避免 peer-joined / signal 在密钥派生完成前到达）
+  let keyReadyResolve = null;
+  const keyReady = new Promise((resolve) => { keyReadyResolve = resolve; });
+  function markKeyReady() {
+    if (keyReadyResolve) {
+      keyReadyResolve();
+      keyReadyResolve = null;
+    }
+  }
+  async function waitForKey() {
+    if (cryptoKey) return;
+    await keyReady;
+  }
+
+  // 大块二进制安全转 base64（避免 String.fromCharCode(...大数组) 爆栈）
+  function u8ToBase64(u8) {
+    let s = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < u8.length; i += chunk) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+    }
+    return btoa(s);
+  }
+  function base64ToU8(b64) {
+    const s = atob(b64);
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+    return u8;
+  }
+
   async function encrypt(obj) {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const plaintext = new TextEncoder().encode(JSON.stringify(obj));
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, plaintext);
     return {
-      iv: btoa(String.fromCharCode(...iv)),
-      ct: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+      iv: u8ToBase64(iv),
+      ct: u8ToBase64(new Uint8Array(ciphertext))
     };
   }
 
   async function decrypt(payload) {
-    const iv = Uint8Array.from(atob(payload.iv), c => c.charCodeAt(0));
-    const ct = Uint8Array.from(atob(payload.ct), c => c.charCodeAt(0));
+    const iv = base64ToU8(payload.iv);
+    const ct = base64ToU8(payload.ct);
     const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ct);
     return JSON.parse(new TextDecoder().decode(plaintext));
   }
@@ -123,6 +157,8 @@
     sessionCode.textContent = code;
     chatInput.disabled = false;
     btnSend.disabled = false;
+    // 确保文件选择也可用
+    if (fileInput) fileInput.disabled = false;
   }
 
   function addChat(text, mine = false) {
@@ -244,6 +280,8 @@
         joinStatus.className = 'status error';
         break;
       case 'peer-joined':
+        // 必须等密钥就绪，否则后续加密信令会失败
+        await waitForKey();
         setConnStatus('对端已加入，正在建立安全通道…');
         addChat('对方已进入房间，正在协商加密通道…', false);
         await startWebRTC();
@@ -259,6 +297,7 @@
         break;
       case 'signal':
         try {
+          await waitForKey();
           const plain = await decrypt(msg.data);
           await handleSignal(plain);
         } catch (e) {
@@ -267,6 +306,7 @@
         break;
       case 'relay-data':
         try {
+          await waitForKey();
           const plain = await decrypt(msg.data);
           handleIncomingMessage(plain);
         } catch (e) {
@@ -278,36 +318,86 @@
     }
   }
 
+  function enableRelay(reason) {
+    if (relayReady) return;
+    relayReady = true;
+    useRelay = true;
+    setConnStatus('已连接 (中继)', 'connected');
+    updateChannelInfo();
+    addChat('✅ ' + (reason || '已启用加密中继通道，可以开始聊天和传文件。'), false);
+    chatInput.disabled = false;
+    btnSend.disabled = false;
+    try { chatInput.focus(); } catch (_) {}
+    console.log('[relay] enabled:', reason || 'fallback');
+    // 主动发一个中继 hello，确认双向通畅
+    sendAppMessage({ type: 'hello', text: 'relay-ready' }).catch(() => {});
+  }
+
   async function startWebRTC() {
     if (pc) return;
-    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    await waitForKey();
+    console.log('[webrtc] start, isCreator=', isCreator);
+
+    pc = new RTCPeerConnection({
+      iceServers: ICE_SERVERS,
+      iceCandidatePoolSize: 4
+    });
+
     pc.onicecandidate = async (ev) => {
-      if (ev.candidate) await sendSignal({ type: 'candidate', candidate: ev.candidate });
+      if (ev.candidate) {
+        try {
+          await sendSignal({
+            type: 'candidate',
+            candidate: {
+              candidate: ev.candidate.candidate,
+              sdpMid: ev.candidate.sdpMid,
+              sdpMLineIndex: ev.candidate.sdpMLineIndex,
+              usernameFragment: ev.candidate.usernameFragment
+            }
+          });
+        } catch (e) {
+          console.warn('[webrtc] send candidate failed', e);
+        }
+      }
     };
+
     pc.onconnectionstatechange = () => {
+      console.log('[webrtc] state=', pc.connectionState);
       updateChannelInfo();
       if (pc.connectionState === 'connected') {
         setConnStatus('已连接 (P2P)', 'connected');
         useRelay = false;
+        relayReady = true;
         updateChannelInfo();
-      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        setTimeout(() => {
-          if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) {
-            useRelay = true;
-            setConnStatus('已连接 (中继)', 'connected');
-            updateChannelInfo();
-            addChat('P2P 直连失败，已切换到加密中继模式。', false);
-          }
-        }, 4000);
+      } else if (pc.connectionState === 'failed') {
+        enableRelay('P2P 直连失败，已切换到加密中继模式。');
       }
     };
+
     pc.ondatachannel = (ev) => setupDataChannel(ev.channel);
+
+    // 3 秒内未建立 P2P 则启用中继（局域网 ICE 失败很常见，中继保证可用）
+    setTimeout(() => {
+      if (!(dataChannel && dataChannel.readyState === 'open')) {
+        enableRelay('已启用加密中继通道，可以开始聊天和传文件。');
+      }
+    }, 3000);
+
     if (isCreator) {
       dataChannel = pc.createDataChannel('vpn-wormhole', { ordered: true });
       setupDataChannel(dataChannel);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await sendSignal({ type: 'offer', sdp: pc.localDescription });
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await sendSignal({
+          type: 'offer',
+          sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+        });
+        console.log('[webrtc] offer sent');
+      } catch (e) {
+        console.error('[webrtc] offer failed', e);
+        enableRelay('WebRTC 协商失败，已切换到加密中继。');
+      }
     }
   }
 
@@ -316,9 +406,10 @@
     channel.binaryType = 'arraybuffer';
     channel.onopen = () => {
       useRelay = false;
+      relayReady = true;
       setConnStatus('已连接 (P2P)', 'connected');
       updateChannelInfo();
-      addChat('安全通道已建立，可以开始聊天和传文件。', false);
+      addChat('安全通道已建立（P2P），可以开始聊天和传文件。', false);
       sendAppMessage({ type: 'hello', text: '通道就绪' });
     };
     channel.onmessage = async (ev) => {
@@ -338,52 +429,91 @@
   }
 
   async function sendSignal(obj) {
-    if (!cryptoKey || !ws || ws.readyState !== 1) return;
+    if (!ws || ws.readyState !== 1) return;
+    await waitForKey();
+    if (!cryptoKey) return;
     const sealed = await encrypt(obj);
     ws.send(JSON.stringify({ type: 'signal', data: sealed }));
   }
 
   async function handleSignal(msg) {
     if (!pc) await startWebRTC();
-    if (msg.type === 'offer') {
-      await pc.setRemoteDescription(msg.sdp);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      await sendSignal({ type: 'answer', sdp: pc.localDescription });
-    } else if (msg.type === 'answer') {
-      await pc.setRemoteDescription(msg.sdp);
-    } else if (msg.type === 'candidate') {
-      try { await pc.addIceCandidate(msg.candidate); } catch (e) { console.warn(e); }
+    try {
+      if (msg.type === 'offer') {
+        // JSON 往返后必须重新构造 RTCSessionDescription
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await sendSignal({
+          type: 'answer',
+          sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+        });
+        console.log('[webrtc] answer sent');
+      } else if (msg.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        console.log('[webrtc] answer applied');
+      } else if (msg.type === 'candidate' && msg.candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch (e) {
+          console.warn('[webrtc] addIceCandidate', e.message || e);
+        }
+      }
+    } catch (e) {
+      console.error('[webrtc] handleSignal error', e);
+      enableRelay('WebRTC 信令处理失败，已切换到加密中继。');
     }
   }
 
   async function sendAppMessage(obj) {
+    await waitForKey();
     if (!cryptoKey) return;
-    if (dataChannel && dataChannel.readyState === 'open' && !useRelay) {
+
+    const canUseDc = dataChannel && dataChannel.readyState === 'open' && !useRelay;
+    if (canUseDc) {
       const sealed = await encrypt(obj);
       dataChannel.send(JSON.stringify(sealed));
-    } else {
-      useRelay = true;
-      updateChannelInfo();
-      const sealed = await encrypt(obj);
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'relay-data', data: sealed }));
-      }
+      return;
+    }
+
+    // 中继路径
+    useRelay = true;
+    updateChannelInfo();
+    const sealed = await encrypt(obj);
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'relay-data', data: sealed }));
     }
   }
 
   function handleIncomingMessage(msg) {
     switch (msg.type) {
-      case 'hello': break;
-      case 'chat': addChat(msg.text, false); break;
-      case 'file-meta': onFileMeta(msg); break;
+      case 'hello':
+        // 对端中继/通道就绪确认
+        if (!relayReady) {
+          relayReady = true;
+          useRelay = true;
+          setConnStatus('已连接 (中继)', 'connected');
+          updateChannelInfo();
+          addChat('✅ 与对方的加密通道已确认，可以发送消息和文件。', false);
+          chatInput.disabled = false;
+          btnSend.disabled = false;
+        }
+        break;
+      case 'chat':
+        addChat(msg.text, false);
+        break;
+      case 'file-meta':
+        onFileMeta(msg);
+        break;
       case 'file-chunk':
-        decryptBinary(Uint8Array.from(atob(msg.data), c => c.charCodeAt(0)))
+        decryptBinary(base64ToU8(msg.data))
           .then(dec => handleBinaryChunk(new Uint8Array(dec)))
           .catch(console.error);
         break;
-      case 'file-done': break;
-      default: console.log('unknown', msg);
+      case 'file-done':
+        break;
+      default:
+        console.log('unknown', msg);
     }
   }
 
@@ -430,7 +560,7 @@
           }
           dataChannel.send(encrypted);
         } else {
-          const b64 = btoa(String.fromCharCode(...encrypted));
+          const b64 = u8ToBase64(encrypted);
           await sendAppMessage({ type: 'file-chunk', transferId, index: i, total, data: b64 });
         }
         bar.style.width = Math.round(((i + 1) / total) * 100) + '%';
@@ -523,7 +653,7 @@
 
   $('#btn-create').addEventListener('click', async () => {
     if (!ensureCrypto()) {
-      createStatus.textContent = '当前环境不支持加密（请用 localhost 或 HTTPS 访问）';
+      createStatus.textContent = '当前环境不支持加密（请用 HTTPS 访问）';
       createStatus.className = 'status error';
       return;
     }
@@ -531,10 +661,8 @@
     createStatus.className = 'status';
     try {
       await connectWS();
-      // Wait for room-created (or error) via the permanent handler
       const msg = await new Promise((resolve, reject) => {
         pendingCreate = { resolve, reject };
-        // Safety timeout
         setTimeout(() => {
           if (pendingCreate) {
             pendingCreate.reject(new Error('创建超时，请检查网络或刷新页面重试'));
@@ -546,7 +674,10 @@
 
       roomCode = msg.code;
       isCreator = true;
+      createStatus.textContent = '正在派生加密密钥…';
       cryptoKey = await deriveKey(roomCode);
+      markKeyReady();
+
       roomCodeEl.textContent = roomCode;
       codeDisplay.classList.remove('hidden');
       createStatus.textContent = '房间已创建，等待对方加入…';
@@ -580,7 +711,7 @@
 
   $('#btn-join').addEventListener('click', async () => {
     if (!ensureCrypto()) {
-      joinStatus.textContent = '当前环境不支持加密（请用 localhost 或 HTTPS 访问）';
+      joinStatus.textContent = '当前环境不支持加密（请用 HTTPS 访问）';
       joinStatus.className = 'status error';
       return;
     }
@@ -590,9 +721,16 @@
       joinStatus.className = 'status error';
       return;
     }
-    joinStatus.textContent = '正在加入…';
+    joinStatus.textContent = '正在派生加密密钥…';
     joinStatus.className = 'status';
     try {
+      // 加入方在发 join 之前就知道房间码，先派生密钥，避免 peer-joined / signal 抢跑
+      isCreator = false;
+      roomCode = code;
+      cryptoKey = await deriveKey(code);
+      markKeyReady();
+
+      joinStatus.textContent = '正在加入…';
       await connectWS();
       const msg = await new Promise((resolve, reject) => {
         pendingJoin = { resolve, reject };
@@ -605,13 +743,15 @@
         ws.send(JSON.stringify({ type: 'join-room', code }));
       });
 
-      roomCode = msg.code;
-      isCreator = false;
-      cryptoKey = await deriveKey(roomCode);
+      roomCode = msg.code || code;
       joinStatus.textContent = '加入成功';
       joinStatus.className = 'status ok';
       showSession(roomCode);
-      setConnStatus('等待通道建立…');
+      // 不在这里写死「等待通道建立」，由 peer-joined / WebRTC 状态更新
+      // 若 peer-joined 已在密钥就绪后处理过，状态会是「正在建立安全通道」
+      if (!pc) {
+        setConnStatus('等待通道建立…');
+      }
     } catch (e) {
       console.error('join failed', e);
       joinStatus.textContent = e.message || '连接服务器失败';
