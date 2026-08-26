@@ -43,7 +43,8 @@ ROOM_TTL_MINUTES=60 npm start    # 60 分钟
 
 ## 功能
 
-- 无账号短码配对（如 `7-apple-river`）
+- 无账号房间码配对（格式 `名牌-口令…`，如 `4821-brave-pearl-a1b2c3`）
+- **名牌 / 口令分离**：服务器只知 nameplate；SPAKE2 口令仅存在于两端浏览器
 - **SPAKE2 PAKE** + AES-256-GCM 端到端加密（短码用于口令认证密钥交换，抗离线字典攻击）
 - 优先 WebRTC P2P，失败自动切加密中继
 - 实时聊天 + 分块文件传输 + SHA-256 校验

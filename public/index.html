@@ -21,7 +21,7 @@
       </div>
 
       <div id="create-panel" class="panel active">
-        <p>点击下方按钮生成短码，把短码安全地告诉对方（电话 / 短信 / 当面）。</p>
+        <p>点击下方生成完整房间码（名牌由服务器分配，口令在本地生成）。请通过电话/当面把<strong>完整码</strong>告诉对方；服务器只看到名牌，看不到口令。</p>
         <button id="btn-create" class="btn primary">生成房间码</button>
         <div id="code-display" class="code-box hidden">
           <span id="room-code"></span>
@@ -31,8 +31,8 @@
       </div>
 
       <div id="join-panel" class="panel">
-        <p>输入对方给你的房间码：</p>
-        <input id="join-code" type="text" placeholder="例如 7-apple-river" autocomplete="off" />
+        <p>输入对方给你的<strong>完整房间码</strong>：</p>
+        <input id="join-code" type="text" placeholder="例如 4821-brave-pearl-a1b2c3" autocomplete="off" />
         <button id="btn-join" class="btn primary">加入</button>
         <p id="join-status" class="status"></p>
       </div>
@@ -86,7 +86,7 @@
     </section>
 
     <footer>
-      <p>短码请通过安全渠道传递。服务器看不到明文内容。房间 <span id="room-ttl-text">—</span> 后自动过期。</p>
+      <p>完整房间码请通过安全渠道传递。服务器只知名牌、不知口令，也看不到聊天/文件明文。房间 <span id="room-ttl-text">—</span> 后自动过期。</p>
     </footer>
   </div>
 

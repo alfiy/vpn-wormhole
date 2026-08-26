@@ -44,7 +44,9 @@
   }
 
   let ws = null;
-  let roomCode = null;
+  let roomCode = null;       // 展示给用户的完整码 = nameplate-password（仅 UI / 复制）
+  let nameplate = null;      // 服务端路由 ID（可被服务器知道）
+  let pakePassword = null;   // SPAKE2 口令（仅本地，不发送给服务器）
   let isCreator = false;
   let cryptoKey = null;
   let pc = null;
@@ -63,6 +65,44 @@
     { urls: 'stun:stun.cloudflare.com:3478' }
   ];
   let relayReady = false;
+
+  // 口令词表（仅客户端使用，服务端无此逻辑）
+  const PAKE_WORDS = [
+    'apple','brave','cloud','delta','eagle','flame','grape','harbor',
+    'ivory','jade','kite','lemon','maple','noble','ocean','pearl',
+    'quartz','river','stone','tiger','umbra','vivid','whale','xenon',
+    'yellow','zebra','amber','blaze','coral','dawn','ember','frost',
+    'glow','haven','iris','jewel','karma','lunar','mist','nova',
+    'orbit','prism','quest','raven','solar','thunder','ultra','vortex'
+  ];
+
+  /** 客户端本地生成高熵口令（不经过服务器） */
+  function generateLocalPassword() {
+    const w1 = PAKE_WORDS[Math.floor(Math.random() * PAKE_WORDS.length)];
+    const w2 = PAKE_WORDS[Math.floor(Math.random() * PAKE_WORDS.length)];
+    const rnd = new Uint8Array(3);
+    crypto.getRandomValues(rnd);
+    const hex = Array.from(rnd).map(b => b.toString(16).padStart(2, '0')).join('');
+    return `${w1}-${w2}-${hex}`;
+  }
+
+  /**
+   * 解析用户输入的完整房间码
+   * 格式: {nameplate}-{password...}  例如 4821-brave-pearl-a1b2c3
+   */
+  function parseDisplayCode(full) {
+    const raw = (full || '').trim().toLowerCase();
+    const parts = raw.split('-').filter(Boolean);
+    if (parts.length < 2) {
+      return { ok: false, error: '房间码格式无效，应为：名牌-口令词-…' };
+    }
+    const np = parts[0];
+    const password = parts.slice(1).join('-');
+    if (!/^[a-z0-9]+$/i.test(np) || password.length < 3) {
+      return { ok: false, error: '房间码格式无效' };
+    }
+    return { ok: true, nameplate: np, password, display: `${np}-${password}` };
+  }
 
   // ---------- SPAKE2 PAKE ----------
   // 真正的口令认证密钥交换：短码仅用于 PAKE，会话密钥由协商产生（抗离线字典）
@@ -100,7 +140,8 @@
     const side = isCreator ? 'A' : 'B';
     console.log('[pake] start SPAKE2 side=', side);
     setConnStatus('正在进行 SPAKE2 密钥协商…');
-    spakeInstance = SPAKE2.create(roomCode, side);
+    if (!pakePassword) throw new Error('缺少本地口令，无法进行 SPAKE2');
+    spakeInstance = SPAKE2.create(pakePassword, side);
     const myMsg = await spakeInstance.start();
     const b64 = SPAKE2.bytesToBase64(myMsg);
     if (ws && ws.readyState === 1) {
@@ -287,7 +328,7 @@
           console.warn('[ws] invalid json', ev.data);
           return;
         }
-        console.log('[ws] recv', msg.type, msg.code || '');
+        console.log('[ws] recv', msg.type, msg.nameplate || msg.code || '');
         await handleServerMessage(msg);
       };
     });
@@ -723,16 +764,21 @@
         ws.send(JSON.stringify({ type: 'create-room' }));
       });
 
-      roomCode = msg.code;
+      // 服务端只给 nameplate；口令本地生成，永不上传
+      nameplate = msg.nameplate || msg.code;
+      if (!nameplate) throw new Error('服务器未返回 nameplate');
+      pakePassword = generateLocalPassword();
+      roomCode = `${nameplate}-${pakePassword}`;
       isCreator = true;
       resetKeyReady();
 
       roomCodeEl.textContent = roomCode;
       codeDisplay.classList.remove('hidden');
-      createStatus.textContent = '房间已创建，等待对方加入后进行 SPAKE2 协商…';
+      createStatus.textContent = '房间已创建。请把完整房间码私下发给对方（服务器看不到口令部分）。';
       createStatus.className = 'status ok';
       showSession(roomCode);
       setConnStatus('等待对方加入…');
+      console.log('[room] nameplate=', nameplate, '(password kept local)');
     } catch (e) {
       console.error('create failed', e);
       createStatus.textContent = e.message || '连接服务器失败';
@@ -764,20 +810,27 @@
       joinStatus.className = 'status error';
       return;
     }
-    const code = joinCodeInput.value.trim().toLowerCase();
-    if (!code) {
-      joinStatus.textContent = '请输入房间码';
+    const raw = joinCodeInput.value.trim().toLowerCase();
+    if (!raw) {
+      joinStatus.textContent = '请输入完整房间码';
       joinStatus.className = 'status error';
       return;
     }
-    joinStatus.textContent = '正在派生加密密钥…';
+    const parsed = parseDisplayCode(raw);
+    if (!parsed.ok) {
+      joinStatus.textContent = parsed.error;
+      joinStatus.className = 'status error';
+      return;
+    }
+    joinStatus.textContent = '正在加入…';
     joinStatus.className = 'status';
     try {
       isCreator = false;
-      roomCode = code;
+      nameplate = parsed.nameplate;
+      pakePassword = parsed.password; // 只留在本地
+      roomCode = parsed.display;
       resetKeyReady();
 
-      joinStatus.textContent = '正在加入…';
       await connectWS();
       const msg = await new Promise((resolve, reject) => {
         pendingJoin = { resolve, reject };
@@ -787,18 +840,18 @@
             pendingJoin = null;
           }
         }, 8000);
-        ws.send(JSON.stringify({ type: 'join-room', code }));
+        // 只向服务器提交 nameplate，不提交口令
+        ws.send(JSON.stringify({ type: 'join-room', nameplate }));
       });
 
-      roomCode = msg.code || code;
+      if (msg.nameplate) nameplate = msg.nameplate;
       joinStatus.textContent = '加入成功';
       joinStatus.className = 'status ok';
       showSession(roomCode);
-      // 不在这里写死「等待通道建立」，由 peer-joined / WebRTC 状态更新
-      // 若 peer-joined 已在密钥就绪后处理过，状态会是「正在建立安全通道」
       if (!pc) {
         setConnStatus('等待通道建立…');
       }
+      console.log('[room] joined nameplate=', nameplate, '(password kept local)');
     } catch (e) {
       console.error('join failed', e);
       joinStatus.textContent = e.message || '连接服务器失败';

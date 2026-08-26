@@ -22,21 +22,16 @@ const CERT_DIR = path.join(__dirname, 'certs');
 const KEY_FILE = path.join(CERT_DIR, 'key.pem');
 const CERT_FILE = path.join(CERT_DIR, 'cert.pem');
 
-const rooms = new Map(); // code -> { clients: Map, createdAt }
+const rooms = new Map(); // nameplate -> { clients: Map, createdAt }
+// 服务端只分配 nameplate（路由 ID），从不生成/存储 SPAKE2 口令
 
-function generateCode() {
-  const words = [
-    'apple','brave','cloud','delta','eagle','flame','grape','harbor',
-    'ivory','jade','kite','lemon','maple','noble','ocean','pearl',
-    'quartz','river','stone','tiger','umbra','vivid','whale','xenon',
-    'yellow','zebra','amber','blaze','coral','dawn','ember','frost',
-    'glow','haven','iris','jewel','karma','lunar','mist','nova',
-    'orbit','prism','quest','raven','solar','thunder','ultra','vortex'
-  ];
-  const n = Math.floor(Math.random() * 16) + 1;
-  const w1 = words[Math.floor(Math.random() * words.length)];
-  const w2 = words[Math.floor(Math.random() * words.length)];
-  return `${n}-${w1}-${w2}`;
+function generateNameplate() {
+  // 短数字名牌，便于人口头传递；唯一性由 rooms Map 保证
+  let n;
+  do {
+    n = String(Math.floor(Math.random() * 9000) + 1000); // 1000-9999
+  } while (rooms.has(n));
+  return n;
 }
 
 function cleanRooms() {
@@ -177,7 +172,7 @@ function createAppHandler() {
       for (const [code, room] of rooms) {
         const ageSec = Math.floor((now - room.createdAt) / 1000);
         list.push({
-          code,
+          nameplate: code,
           members: room.clients.size,
           ageSec,
           remainSec: Math.max(0, Math.floor((ROOM_TTL_MS - (now - room.createdAt)) / 1000))
@@ -211,22 +206,23 @@ function attachWebSocket(server) {
 
       switch (msg.type) {
         case 'create-room': {
-          let code;
-          do {
-            code = generateCode();
-          } while (rooms.has(code));
+          // 只返回 nameplate；口令由客户端本地生成，服务端永不接收
+          const nameplate = generateNameplate();
           const room = { clients: new Map(), createdAt: Date.now() };
           room.clients.set(ws, { role: 'creator', joinedAt: Date.now() });
-          rooms.set(code, room);
-          ws.roomCode = code;
-          ws.send(JSON.stringify({ type: 'room-created', code }));
-          console.log('[room] created', code);
+          rooms.set(nameplate, room);
+          ws.roomCode = nameplate; // 内部仅存 nameplate
+          ws.send(JSON.stringify({ type: 'room-created', nameplate }));
+          console.log('[room] created nameplate=', nameplate);
           break;
         }
 
         case 'join-room': {
-          const code = (msg.code || '').trim().toLowerCase();
-          const room = rooms.get(code);
+          // 客户端只提交 nameplate，不得提交完整口令
+          const nameplate = String(msg.nameplate || msg.code || '').trim().toLowerCase();
+          // 拒绝疑似完整房间码（含多个 '-' 的口令形态）被当成 nameplate 误用时仍只取第一段
+          const np = nameplate.split('-')[0];
+          const room = rooms.get(np);
           if (!room) {
             ws.send(JSON.stringify({ type: 'error', error: '房间不存在或已过期' }));
             return;
@@ -236,15 +232,15 @@ function attachWebSocket(server) {
             return;
           }
           room.clients.set(ws, { role: 'joiner', joinedAt: Date.now() });
-          ws.roomCode = code;
-          ws.send(JSON.stringify({ type: 'room-joined', code }));
+          ws.roomCode = np;
+          ws.send(JSON.stringify({ type: 'room-joined', nameplate: np }));
 
           for (const [client] of room.clients) {
             if (client.readyState === 1) {
               client.send(JSON.stringify({ type: 'peer-joined' }));
             }
           }
-          console.log('[room] joined', code);
+          console.log('[room] joined nameplate=', np);
           break;
         }
 
