@@ -25,7 +25,25 @@ ROOM_TTL_MINUTES=10 npm start    # 10 分钟
 ROOM_TTL_MINUTES=60 npm start    # 60 分钟
 ```
 
-也可在 systemd / Docker 里用环境变量 `ROOM_TTL_MINUTES` 配置。  
+也可在 systemd / Docker 里用环境变量配置：
+
+```bash
+ROOM_TTL_MINUTES=10 \
+JOIN_MAX_FAILS=8 \
+JOIN_MAX_ATTEMPTS=20 \
+JOIN_RATE_WINDOW_SEC=60 \
+CREATE_MAX_PER_WINDOW=10 \
+npm start
+```
+
+| 变量                    | 默认 | 含义                     |
+| ----------------------- | ---- | ------------------------ |
+| `ROOM_TTL_MINUTES`      | 30   | 房间过期（分钟）         |
+| `JOIN_MAX_FAILS`        | 8    | 窗口内允许的失败加入次数 |
+| `JOIN_MAX_ATTEMPTS`     | 20   | 窗口内允许的加入尝试次数 |
+| `JOIN_RATE_WINDOW_SEC`  | 60   | 限速时间窗口（秒）       |
+| `CREATE_MAX_PER_WINDOW` | 10   | 窗口内允许创建房间次数   |
+
 启动后终端会打印当前过期时间与访问地址。
 
 ### 客户端怎么用
@@ -45,7 +63,8 @@ ROOM_TTL_MINUTES=60 npm start    # 60 分钟
 
 - 无账号房间码配对（格式 `名牌-口令…`，如 `4821-brave-pearl-a1b2c3`）
 - **名牌 / 口令分离**：服务器只知 nameplate；SPAKE2 口令仅存在于两端浏览器
-- **SPAKE2 PAKE** + AES-256-GCM 端到端加密（短码用于口令认证密钥交换，抗离线字典攻击）
+- **SPAKE2 PAKE** + **密钥确认** + AES-256-GCM 端到端加密
+- 服务端加入/创建 **按 IP 限速**，抑制在线撞名牌
 - 优先 WebRTC P2P，失败自动切加密中继
 - 实时聊天 + 分块文件传输 + SHA-256 校验
 - 房间自动过期（默认 30 分钟，可用环境变量 `ROOM_TTL_MINUTES` 配置），仅支持两人

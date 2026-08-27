@@ -112,6 +112,9 @@
   let pendingPakeMsg = null; // 若 peer 的 pake 消息先到，先缓存
   let spakeInstance = null;
 
+  let keyConfirmed = false;
+  let pendingConfirmMsg = null;
+
   function markKeyReady() {
     pakeDone = true;
     if (keyReadyResolve) {
@@ -126,14 +129,89 @@
 
   function resetKeyReady() {
     pakeDone = false;
+    keyConfirmed = false;
     cryptoKey = null;
     pendingPakeMsg = null;
+    pendingConfirmMsg = null;
     spakeInstance = null;
+    window.__pakeWait = null;
+    window.__confirmWait = null;
     keyReady = new Promise((resolve) => { keyReadyResolve = resolve; });
   }
 
+  function randomNonceHex(bytes = 16) {
+    const buf = new Uint8Array(bytes);
+    crypto.getRandomValues(buf);
+    return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  /**
+   * SPAKE2 之后的密钥确认：双方用新密钥加密交换 nonce。
+   * 能成功解密对端 confirm = 证明双方持有同一 AES 密钥。
+   */
+  async function runKeyConfirm() {
+    setConnStatus('正在进行密钥确认…');
+    const myNonce = randomNonceHex(16);
+    console.log('[confirm] sending key-confirm');
+
+    // 通过加密中继发送（此时尚无 DataChannel）
+    const sealed = await encrypt({ type: 'key-confirm', nonce: myNonce, side: isCreator ? 'A' : 'B' });
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'relay-data', data: sealed }));
+    }
+
+    const peerMsg = await new Promise((resolve, reject) => {
+      if (pendingConfirmMsg) {
+        const m = pendingConfirmMsg;
+        pendingConfirmMsg = null;
+        resolve(m);
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error('密钥确认超时：双方密钥可能不一致或网络异常')), 12000);
+      window.__confirmWait = (msg) => {
+        clearTimeout(timer);
+        window.__confirmWait = null;
+        resolve(msg);
+      };
+    });
+
+    if (!peerMsg || peerMsg.type !== 'key-confirm' || !peerMsg.nonce) {
+      throw new Error('密钥确认失败：无效的对端确认消息');
+    }
+    if (peerMsg.nonce === myNonce) {
+      throw new Error('密钥确认失败：异常的 nonce');
+    }
+
+    // 回传 ack（同样加密），便于对端日志与双向确认
+    const ackSealed = await encrypt({
+      type: 'key-confirm-ack',
+      nonce: myNonce,
+      peerNonce: peerMsg.nonce
+    });
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'relay-data', data: ackSealed }));
+    }
+
+    keyConfirmed = true;
+    console.log('[confirm] key confirmation OK');
+  }
+
+  function onKeyConfirmMessage(msg) {
+    if (msg.type === 'key-confirm') {
+      if (window.__confirmWait) {
+        window.__confirmWait(msg);
+      } else {
+        pendingConfirmMsg = msg;
+      }
+    }
+    // key-confirm-ack 仅作日志
+    if (msg.type === 'key-confirm-ack') {
+      console.log('[confirm] received ack from peer');
+    }
+  }
+
   async function runPAKE() {
-    if (cryptoKey) return;
+    if (cryptoKey && keyConfirmed) return;
     if (typeof SPAKE2 === 'undefined') {
       throw new Error('SPAKE2 库未加载');
     }
@@ -167,10 +245,13 @@
     const peerMsg = SPAKE2.base64ToBytes(peerB64);
     const keyMaterial = await spakeInstance.finish(peerMsg);
     cryptoKey = await SPAKE2.keyMaterialToAesGcm(keyMaterial);
-    markKeyReady();
+    markKeyReady(); // 允许 encrypt/decrypt，供密钥确认使用
     console.log('[pake] SPAKE2 complete, AES key ready');
-    setConnStatus('密钥协商完成，正在建立通道…');
-    addChat('✅ SPAKE2 密钥协商成功，通信已端到端加密。', false);
+
+    await runKeyConfirm();
+
+    setConnStatus('密钥确认完成，正在建立通道…');
+    addChat('✅ SPAKE2 协商与密钥确认成功，通信已端到端加密。', false);
   }
 
   async function onPakeMessage(data) {
@@ -579,6 +660,10 @@
 
   function handleIncomingMessage(msg) {
     switch (msg.type) {
+      case 'key-confirm':
+      case 'key-confirm-ack':
+        onKeyConfirmMessage(msg);
+        break;
       case 'hello':
         // 对端中继/通道就绪确认
         if (!relayReady) {
@@ -610,6 +695,10 @@
   }
 
   function sendChat() {
+    if (!keyConfirmed) {
+      addChat('密钥尚未确认，请稍候…', false);
+      return;
+    }
     const text = chatInput.value.trim();
     if (!text) return;
     addChat(text, true);

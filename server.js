@@ -17,6 +17,11 @@ const PORT = process.env.PORT || 3080;
 // 房间过期时间（分钟）。部署时设置，例如：ROOM_TTL_MINUTES=5 npm start
 const ROOM_TTL_MINUTES = Math.max(1, parseInt(process.env.ROOM_TTL_MINUTES || '30', 10) || 30);
 const ROOM_TTL_MS = ROOM_TTL_MINUTES * 60 * 1000;
+// 加入限速：按 IP 统计（可用环境变量调整）
+const JOIN_RATE_WINDOW_MS = Math.max(10, parseInt(process.env.JOIN_RATE_WINDOW_SEC || '60', 10) || 60) * 1000;
+const JOIN_MAX_FAILS = Math.max(3, parseInt(process.env.JOIN_MAX_FAILS || '8', 10) || 8);
+const JOIN_MAX_ATTEMPTS = Math.max(5, parseInt(process.env.JOIN_MAX_ATTEMPTS || '20', 10) || 20);
+const CREATE_MAX_PER_WINDOW = Math.max(3, parseInt(process.env.CREATE_MAX_PER_WINDOW || '10', 10) || 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CERT_DIR = path.join(__dirname, 'certs');
 const KEY_FILE = path.join(CERT_DIR, 'key.pem');
@@ -24,6 +29,62 @@ const CERT_FILE = path.join(CERT_DIR, 'cert.pem');
 
 const rooms = new Map(); // nameplate -> { clients: Map, createdAt }
 // 服务端只分配 nameplate（路由 ID），从不生成/存储 SPAKE2 口令
+
+/** @type {Map<string, { fails: number, attempts: number, creates: number, resetAt: number, blockedUntil: number }>} */
+const ipLimits = new Map();
+
+function clientIpFromReq(req) {
+  const xf = (req && req.headers && req.headers['x-forwarded-for']) || '';
+  if (xf) return String(xf).split(',')[0].trim();
+  const addr = (req && req.socket && req.socket.remoteAddress) || 'unknown';
+  return addr.replace(/^::ffff:/, '');
+}
+
+function getIpLimit(ip) {
+  const now = Date.now();
+  let e = ipLimits.get(ip);
+  if (!e || now > e.resetAt) {
+    e = { fails: 0, attempts: 0, creates: 0, resetAt: now + JOIN_RATE_WINDOW_MS, blockedUntil: 0 };
+    ipLimits.set(ip, e);
+  }
+  return e;
+}
+
+function assertNotBlocked(ip) {
+  const e = getIpLimit(ip);
+  if (e.blockedUntil && Date.now() < e.blockedUntil) {
+    const sec = Math.ceil((e.blockedUntil - Date.now()) / 1000);
+    return { ok: false, error: `尝试过多，请 ${sec} 秒后再试` };
+  }
+  return { ok: true, entry: e };
+}
+
+function noteJoinFail(ip) {
+  const e = getIpLimit(ip);
+  e.fails += 1;
+  e.attempts += 1;
+  if (e.fails >= JOIN_MAX_FAILS || e.attempts >= JOIN_MAX_ATTEMPTS) {
+    e.blockedUntil = Date.now() + JOIN_RATE_WINDOW_MS;
+    console.log('[rate] block ip=', ip, 'fails=', e.fails, 'attempts=', e.attempts);
+  }
+}
+
+function noteJoinSuccess(ip) {
+  const e = getIpLimit(ip);
+  e.attempts += 1;
+  // 成功加入不增加 fails；轻微衰减
+  if (e.fails > 0) e.fails -= 1;
+}
+
+function noteCreate(ip) {
+  const e = getIpLimit(ip);
+  e.creates += 1;
+  if (e.creates > CREATE_MAX_PER_WINDOW) {
+    e.blockedUntil = Date.now() + JOIN_RATE_WINDOW_MS;
+    return { ok: false, error: '创建过于频繁，请稍后再试' };
+  }
+  return { ok: true };
+}
 
 function generateNameplate() {
   // 短数字名牌，便于人口头传递；唯一性由 rooms Map 保证
@@ -161,7 +222,10 @@ function createAppHandler() {
         rooms: rooms.size,
         uptime: Math.floor(process.uptime()),
         roomTtlMinutes: ROOM_TTL_MINUTES,
-        roomTtlMs: ROOM_TTL_MS
+        roomTtlMs: ROOM_TTL_MS,
+        joinMaxFails: JOIN_MAX_FAILS,
+        joinMaxAttempts: JOIN_MAX_ATTEMPTS,
+        joinRateWindowSec: Math.floor(JOIN_RATE_WINDOW_MS / 1000)
       }));
       return;
     }
@@ -190,9 +254,10 @@ function createAppHandler() {
 function attachWebSocket(server) {
   const wss = new WebSocketServer({ server });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.roomCode = null;
+    ws.clientIp = clientIpFromReq(req);
 
     ws.on('pong', () => { ws.isAlive = true; });
 
@@ -206,6 +271,16 @@ function attachWebSocket(server) {
 
       switch (msg.type) {
         case 'create-room': {
+          const blocked = assertNotBlocked(ws.clientIp);
+          if (!blocked.ok) {
+            ws.send(JSON.stringify({ type: 'error', error: blocked.error }));
+            return;
+          }
+          const created = noteCreate(ws.clientIp);
+          if (!created.ok) {
+            ws.send(JSON.stringify({ type: 'error', error: created.error }));
+            return;
+          }
           // 只返回 nameplate；口令由客户端本地生成，服务端永不接收
           const nameplate = generateNameplate();
           const room = { clients: new Map(), createdAt: Date.now() };
@@ -213,24 +288,31 @@ function attachWebSocket(server) {
           rooms.set(nameplate, room);
           ws.roomCode = nameplate; // 内部仅存 nameplate
           ws.send(JSON.stringify({ type: 'room-created', nameplate }));
-          console.log('[room] created nameplate=', nameplate);
+          console.log('[room] created nameplate=', nameplate, 'ip=', ws.clientIp);
           break;
         }
 
         case 'join-room': {
+          const blocked = assertNotBlocked(ws.clientIp);
+          if (!blocked.ok) {
+            ws.send(JSON.stringify({ type: 'error', error: blocked.error }));
+            return;
+          }
           // 客户端只提交 nameplate，不得提交完整口令
           const nameplate = String(msg.nameplate || msg.code || '').trim().toLowerCase();
-          // 拒绝疑似完整房间码（含多个 '-' 的口令形态）被当成 nameplate 误用时仍只取第一段
           const np = nameplate.split('-')[0];
           const room = rooms.get(np);
           if (!room) {
+            noteJoinFail(ws.clientIp);
             ws.send(JSON.stringify({ type: 'error', error: '房间不存在或已过期' }));
             return;
           }
           if (room.clients.size >= 2) {
+            noteJoinFail(ws.clientIp);
             ws.send(JSON.stringify({ type: 'error', error: '房间已满（仅支持两人）' }));
             return;
           }
+          noteJoinSuccess(ws.clientIp);
           room.clients.set(ws, { role: 'joiner', joinedAt: Date.now() });
           ws.roomCode = np;
           ws.send(JSON.stringify({ type: 'room-joined', nameplate: np }));
@@ -240,7 +322,7 @@ function attachWebSocket(server) {
               client.send(JSON.stringify({ type: 'peer-joined' }));
             }
           }
-          console.log('[room] joined nameplate=', np);
+          console.log('[room] joined nameplate=', np, 'ip=', ws.clientIp);
           break;
         }
 
@@ -316,6 +398,7 @@ httpsServer.listen(PORT, '0.0.0.0', () => {
   console.log(`  本机访问:     https://127.0.0.1:${PORT}`);
   console.log(`  局域网访问:   https://<服务器IP>:${PORT}`);
   console.log(`  房间过期:     ${ROOM_TTL_MINUTES} 分钟  (环境变量 ROOM_TTL_MINUTES)`);
+  console.log(`  加入限速:     ${JOIN_MAX_FAILS} 次失败 / ${JOIN_MAX_ATTEMPTS} 次尝试 / ${JOIN_RATE_WINDOW_MS/1000}s`);
   console.log('');
   console.log('  首次用 IP 访问时浏览器会提示「证书不受信任」：');
   console.log('  点击「高级」→「继续访问」即可（自签名证书，仅内网使用）。');
