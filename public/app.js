@@ -58,12 +58,8 @@
   let pendingJoin = null;
 
   const CHUNK_SIZE = 32 * 1024;
-  // 局域网/VPN 下 host 候选通常最可靠；公网 STUN 作为补充
-  const ICE_SERVERS = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
-  ];
+  // 不再使用公网 STUN。ICE 服务器由 /api/config 下发（VPN 内 TURN）
+  let ICE_SERVERS = [];
   let relayReady = false;
 
   // 口令词表（仅客户端使用，服务端无此逻辑）
@@ -967,17 +963,25 @@
     location.reload();
   });
 
-  // 从服务端读取房间过期时间，显示在页脚
+  // 从服务端读取房间 TTL + TURN/ICE
   (async () => {
     const el = document.getElementById('room-ttl-text');
-    if (!el) return;
     try {
       const res = await fetch('/api/config');
       const cfg = await res.json();
-      const m = cfg.roomTtlMinutes || 30;
-      el.textContent = m >= 60 && m % 60 === 0 ? `${m / 60} 小时` : `${m} 分钟`;
+      if (el) {
+        const m = cfg.roomTtlMinutes || 30;
+        el.textContent = m >= 60 && m % 60 === 0 ? `${m / 60} 小时` : `${m} 分钟`;
+      }
+      if (Array.isArray(cfg.iceServers) && cfg.iceServers.length) {
+        ICE_SERVERS = cfg.iceServers;
+        console.log('[ice] TURN enabled', cfg.turnHost + ':' + cfg.turnPort);
+      } else {
+        ICE_SERVERS = [];
+        console.warn('[ice] 未配置 TURN（服务端未设置 TURN_PASS），将仅尝试 host / 加密中继');
+      }
     } catch (_) {
-      el.textContent = '30 分钟';
+      if (el) el.textContent = '30 分钟';
     }
   })();
 })();

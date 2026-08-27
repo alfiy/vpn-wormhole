@@ -17,11 +17,16 @@ const PORT = process.env.PORT || 3080;
 // 房间过期时间（分钟）。部署时设置，例如：ROOM_TTL_MINUTES=5 npm start
 const ROOM_TTL_MINUTES = Math.max(1, parseInt(process.env.ROOM_TTL_MINUTES || '30', 10) || 30);
 const ROOM_TTL_MS = ROOM_TTL_MINUTES * 60 * 1000;
-// 加入限速：按 IP 统计（可用环境变量调整）
+// 限速：VPN 出口常为同一源 IP（SNAT），失败次数按 nameplate 计，IP 只做宽松防洪
 const JOIN_RATE_WINDOW_MS = Math.max(10, parseInt(process.env.JOIN_RATE_WINDOW_SEC || '60', 10) || 60) * 1000;
-const JOIN_MAX_FAILS = Math.max(3, parseInt(process.env.JOIN_MAX_FAILS || '8', 10) || 8);
-const JOIN_MAX_ATTEMPTS = Math.max(5, parseInt(process.env.JOIN_MAX_ATTEMPTS || '20', 10) || 20);
-const CREATE_MAX_PER_WINDOW = Math.max(3, parseInt(process.env.CREATE_MAX_PER_WINDOW || '10', 10) || 10);
+const JOIN_MAX_FAILS_PER_NAMEPLATE = Math.max(3, parseInt(process.env.JOIN_MAX_FAILS || '8', 10) || 8);
+const JOIN_MAX_ATTEMPTS_PER_IP = Math.max(20, parseInt(process.env.JOIN_MAX_ATTEMPTS || '200', 10) || 200);
+const CREATE_MAX_PER_WINDOW = Math.max(5, parseInt(process.env.CREATE_MAX_PER_WINDOW || '80', 10) || 80);
+// TURN（部署在 OpenVPN 服务器上，默认只监听 VPN 地址）
+const TURN_HOST = (process.env.TURN_HOST || '10.8.0.1').trim();
+const TURN_PORT = parseInt(process.env.TURN_PORT || '3478', 10) || 3478;
+const TURN_USER = (process.env.TURN_USER || 'wormhole').trim();
+const TURN_PASS = (process.env.TURN_PASS || '').trim();
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CERT_DIR = path.join(__dirname, 'certs');
 const KEY_FILE = path.join(CERT_DIR, 'key.pem');
@@ -30,8 +35,10 @@ const CERT_FILE = path.join(CERT_DIR, 'cert.pem');
 const rooms = new Map(); // nameplate -> { clients: Map, createdAt }
 // 服务端只分配 nameplate（路由 ID），从不生成/存储 SPAKE2 口令
 
-/** @type {Map<string, { fails: number, attempts: number, creates: number, resetAt: number, blockedUntil: number }>} */
+/** @type {Map<string, { attempts: number, creates: number, resetAt: number, blockedUntil: number }>} */
 const ipLimits = new Map();
+/** @type {Map<string, { fails: number, resetAt: number, blockedUntil: number }>} */
+const nameplateLimits = new Map();
 
 function clientIpFromReq(req) {
   const xf = (req && req.headers && req.headers['x-forwarded-for']) || '';
@@ -40,40 +47,62 @@ function clientIpFromReq(req) {
   return addr.replace(/^::ffff:/, '');
 }
 
-function getIpLimit(ip) {
+function getWindowed(map, key, extra) {
   const now = Date.now();
-  let e = ipLimits.get(ip);
+  let e = map.get(key);
   if (!e || now > e.resetAt) {
-    e = { fails: 0, attempts: 0, creates: 0, resetAt: now + JOIN_RATE_WINDOW_MS, blockedUntil: 0 };
-    ipLimits.set(ip, e);
+    e = Object.assign({ resetAt: now + JOIN_RATE_WINDOW_MS, blockedUntil: 0 }, extra);
+    map.set(key, e);
   }
   return e;
 }
 
-function assertNotBlocked(ip) {
+function getIpLimit(ip) {
+  return getWindowed(ipLimits, ip, { attempts: 0, creates: 0 });
+}
+
+function getNameplateLimit(np) {
+  return getWindowed(nameplateLimits, np, { fails: 0 });
+}
+
+function assertIpNotFlooding(ip) {
   const e = getIpLimit(ip);
   if (e.blockedUntil && Date.now() < e.blockedUntil) {
     const sec = Math.ceil((e.blockedUntil - Date.now()) / 1000);
-    return { ok: false, error: `尝试过多，请 ${sec} 秒后再试` };
+    return { ok: false, error: `请求过于频繁，请 ${sec} 秒后再试` };
   }
   return { ok: true, entry: e };
 }
 
-function noteJoinFail(ip) {
-  const e = getIpLimit(ip);
-  e.fails += 1;
-  e.attempts += 1;
-  if (e.fails >= JOIN_MAX_FAILS || e.attempts >= JOIN_MAX_ATTEMPTS) {
-    e.blockedUntil = Date.now() + JOIN_RATE_WINDOW_MS;
-    console.log('[rate] block ip=', ip, 'fails=', e.fails, 'attempts=', e.attempts);
+function assertNameplateJoinAllowed(np) {
+  const e = getNameplateLimit(np);
+  if (e.blockedUntil && Date.now() < e.blockedUntil) {
+    const sec = Math.ceil((e.blockedUntil - Date.now()) / 1000);
+    return { ok: false, error: `该房间尝试次数过多，请 ${sec} 秒后再试` };
+  }
+  return { ok: true, entry: e };
+}
+
+function noteJoinFail(ip, np) {
+  const ipE = getIpLimit(ip);
+  ipE.attempts += 1;
+  if (ipE.attempts >= JOIN_MAX_ATTEMPTS_PER_IP) {
+    ipE.blockedUntil = Date.now() + JOIN_RATE_WINDOW_MS;
+    console.log('[rate] flood-block ip=', ip, 'attempts=', ipE.attempts);
+  }
+  if (np) {
+    const npE = getNameplateLimit(np);
+    npE.fails += 1;
+    if (npE.fails >= JOIN_MAX_FAILS_PER_NAMEPLATE) {
+      npE.blockedUntil = Date.now() + JOIN_RATE_WINDOW_MS;
+      console.log('[rate] block nameplate=', np, 'fails=', npE.fails);
+    }
   }
 }
 
 function noteJoinSuccess(ip) {
   const e = getIpLimit(ip);
   e.attempts += 1;
-  // 成功加入不增加 fails；轻微衰减
-  if (e.fails > 0) e.fails -= 1;
 }
 
 function noteCreate(ip) {
@@ -93,6 +122,16 @@ function generateNameplate() {
     n = String(Math.floor(Math.random() * 9000) + 1000); // 1000-9999
   } while (rooms.has(n));
   return n;
+}
+
+/** 下发给浏览器的 ICE 配置：无公网 STUN，仅 VPN 内 TURN */
+function getIceServers() {
+  if (!TURN_PASS) return [];
+  const host = `${TURN_HOST}:${TURN_PORT}`;
+  return [
+    { urls: `turn:${host}?transport=udp`, username: TURN_USER, credential: TURN_PASS },
+    { urls: `turn:${host}?transport=tcp`, username: TURN_USER, credential: TURN_PASS }
+  ];
 }
 
 function cleanRooms() {
@@ -223,9 +262,14 @@ function createAppHandler() {
         uptime: Math.floor(process.uptime()),
         roomTtlMinutes: ROOM_TTL_MINUTES,
         roomTtlMs: ROOM_TTL_MS,
-        joinMaxFails: JOIN_MAX_FAILS,
-        joinMaxAttempts: JOIN_MAX_ATTEMPTS,
-        joinRateWindowSec: Math.floor(JOIN_RATE_WINDOW_MS / 1000)
+        joinMaxFailsPerNameplate: JOIN_MAX_FAILS_PER_NAMEPLATE,
+        joinMaxAttemptsPerIp: JOIN_MAX_ATTEMPTS_PER_IP,
+        joinRateWindowSec: Math.floor(JOIN_RATE_WINDOW_MS / 1000),
+        createMaxPerWindow: CREATE_MAX_PER_WINDOW,
+        turnHost: TURN_HOST,
+        turnPort: TURN_PORT,
+        turnEnabled: Boolean(TURN_PASS),
+        iceServers: getIceServers()
       }));
       return;
     }
@@ -271,7 +315,7 @@ function attachWebSocket(server) {
 
       switch (msg.type) {
         case 'create-room': {
-          const blocked = assertNotBlocked(ws.clientIp);
+          const blocked = assertIpNotFlooding(ws.clientIp);
           if (!blocked.ok) {
             ws.send(JSON.stringify({ type: 'error', error: blocked.error }));
             return;
@@ -293,7 +337,7 @@ function attachWebSocket(server) {
         }
 
         case 'join-room': {
-          const blocked = assertNotBlocked(ws.clientIp);
+          const blocked = assertIpNotFlooding(ws.clientIp);
           if (!blocked.ok) {
             ws.send(JSON.stringify({ type: 'error', error: blocked.error }));
             return;
@@ -302,13 +346,18 @@ function attachWebSocket(server) {
           const nameplate = String(msg.nameplate || msg.code || '').trim().toLowerCase();
           const np = nameplate.split('-')[0];
           const room = rooms.get(np);
+          const npLimit = assertNameplateJoinAllowed(np);
+          if (!npLimit.ok) {
+            ws.send(JSON.stringify({ type: 'error', error: npLimit.error }));
+            return;
+          }
           if (!room) {
-            noteJoinFail(ws.clientIp);
+            noteJoinFail(ws.clientIp, np);
             ws.send(JSON.stringify({ type: 'error', error: '房间不存在或已过期' }));
             return;
           }
           if (room.clients.size >= 2) {
-            noteJoinFail(ws.clientIp);
+            noteJoinFail(ws.clientIp, np);
             ws.send(JSON.stringify({ type: 'error', error: '房间已满（仅支持两人）' }));
             return;
           }
@@ -398,7 +447,12 @@ httpsServer.listen(PORT, '0.0.0.0', () => {
   console.log(`  本机访问:     https://127.0.0.1:${PORT}`);
   console.log(`  局域网访问:   https://<服务器IP>:${PORT}`);
   console.log(`  房间过期:     ${ROOM_TTL_MINUTES} 分钟  (环境变量 ROOM_TTL_MINUTES)`);
-  console.log(`  加入限速:     ${JOIN_MAX_FAILS} 次失败 / ${JOIN_MAX_ATTEMPTS} 次尝试 / ${JOIN_RATE_WINDOW_MS/1000}s`);
+  if (TURN_PASS) {
+    console.log(`  TURN:         turn:${TURN_HOST}:${TURN_PORT}  user=${TURN_USER}`);
+  } else {
+    console.log('  TURN:         未启用（请设置 TURN_PASS，并在本机运行 coturn）');
+  }
+  console.log(`  加入限速:     每名牌 ${JOIN_MAX_FAILS_PER_NAMEPLATE} 次失败 · 每出口IP ${JOIN_MAX_ATTEMPTS_PER_IP} 次尝试 / ${JOIN_RATE_WINDOW_MS/1000}s（适配 VPN SNAT）`);
   console.log('');
   console.log('  首次用 IP 访问时浏览器会提示「证书不受信任」：');
   console.log('  点击「高级」→「继续访问」即可（自签名证书，仅内网使用）。');

@@ -30,21 +30,48 @@ ROOM_TTL_MINUTES=60 npm start    # 60 分钟
 ```bash
 ROOM_TTL_MINUTES=10 \
 JOIN_MAX_FAILS=8 \
-JOIN_MAX_ATTEMPTS=20 \
+JOIN_MAX_ATTEMPTS=200 \
 JOIN_RATE_WINDOW_SEC=60 \
-CREATE_MAX_PER_WINDOW=10 \
+CREATE_MAX_PER_WINDOW=80 \
 npm start
 ```
 
-| 变量                    | 默认 | 含义                     |
-| ----------------------- | ---- | ------------------------ |
-| `ROOM_TTL_MINUTES`      | 30   | 房间过期（分钟）         |
-| `JOIN_MAX_FAILS`        | 8    | 窗口内允许的失败加入次数 |
-| `JOIN_MAX_ATTEMPTS`     | 20   | 窗口内允许的加入尝试次数 |
-| `JOIN_RATE_WINDOW_SEC`  | 60   | 限速时间窗口（秒）       |
-| `CREATE_MAX_PER_WINDOW` | 10   | 窗口内允许创建房间次数   |
+| 变量                    | 默认             | 含义                                                |
+| ----------------------- | ---------------- | --------------------------------------------------- |
+| `ROOM_TTL_MINUTES`      | 30               | 房间过期（分钟）                                    |
+| `JOIN_MAX_FAILS`        | 8                | 同一 nameplate 窗口内失败加入次数                   |
+| `JOIN_MAX_ATTEMPTS`     | 200              | 同一源 IP 窗口内加入尝试上限（防洪，适配 VPN SNAT） |
+| `JOIN_RATE_WINDOW_SEC`  | 60               | 限速时间窗口（秒）                                  |
+| `CREATE_MAX_PER_WINDOW` | 80               | 同一源 IP 窗口内允许创建次数                        |
+| `TURN_HOST`             | 10.8.0.1         | coturn 监听地址（OpenVPN 服务器在 VPN 网内的地址）  |
+| `TURN_PORT`             | 3478             | TURN 端口                                           |
+| `TURN_USER`             | wormhole         | TURN 用户名                                         |
+| `TURN_PASS`             | （空=关闭 TURN） | TURN 密码，必须与 coturn `user=` 一致               |
 
 启动后终端会打印当前过期时间与访问地址。
+
+### 在 OpenVPN 服务器上启用 TURN
+
+浏览器在 VPN 场景下经常选不到 `10.8.0.x` 作为 ICE host，公网 STUN 又会把探测带到公网 IP。  
+因此本项目**已去掉公网 STUN**，改为两端都连接 OpenVPN 本机上的 TURN（`10.8.0.1:3478`）。
+
+```bash
+# 1) 安装 coturn
+sudo apt-get update && sudo apt-get install -y coturn
+
+# 2) 使用项目内配置（先改密码）
+sudo cp deploy/turnserver.conf /etc/turnserver.conf
+sudo sed -i 's/CHANGE_ME_STRONG_PASSWORD/你的强密码/' /etc/turnserver.conf
+
+# Debian 还需: /etc/default/coturn 里 TURNSERVER_ENABLED=1
+sudo systemctl enable --now coturn
+
+# 3) 与 wormhole 使用同一套口令启动
+TURN_HOST=10.8.0.1 TURN_PORT=3478 TURN_USER=wormhole TURN_PASS='你的强密码' npm start
+```
+
+客户端须已连接 OpenVPN，并能访问 `10.8.0.1:3478/udp`（以及 TCP 备用）。  
+`webrtc-internals` 里若出现 `candidateType=relay` 且地址为 `10.8.0.1`，说明 TURN 已生效。
 
 ### 客户端怎么用
 
@@ -64,7 +91,7 @@ npm start
 - 无账号房间码配对（格式 `名牌-口令…`，如 `4821-brave-pearl-a1b2c3`）
 - **名牌 / 口令分离**：服务器只知 nameplate；SPAKE2 口令仅存在于两端浏览器
 - **SPAKE2 PAKE** + **密钥确认** + AES-256-GCM 端到端加密
-- 服务端加入/创建 **按 IP 限速**，抑制在线撞名牌
+- 服务端限速：失败加入按 **nameplate** 计（避免 VPN SNAT 共用一个出口 IP 时误伤整网）
 - 优先 WebRTC P2P，失败自动切加密中继
 - 实时聊天 + 分块文件传输 + SHA-256 校验
 - 房间自动过期（默认 30 分钟，可用环境变量 `ROOM_TTL_MINUTES` 配置），仅支持两人
