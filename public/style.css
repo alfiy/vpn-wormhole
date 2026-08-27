@@ -440,3 +440,17 @@ footer {
   font-size: 0.8rem;
   color: var(--muted);
 }
+.transfer-banner {
+  margin-top: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+  font-size: 0.85rem;
+}
+.eta-text {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}

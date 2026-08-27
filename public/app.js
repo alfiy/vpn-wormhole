@@ -19,6 +19,8 @@
   const createTtlCustom = $('#create-ttl-custom');
   const ttlHint = $('#ttl-hint');
   const roomExpireEl = $('#room-expire');
+  const transferBanner = $('#transfer-banner');
+  const roomTtlText = $('#room-ttl-text');
   const joinCodeInput = $('#join-code');
   const sessionCode = $('#session-code');
   const connStatus = $('#conn-status');
@@ -55,6 +57,7 @@
   let idleUntil = null;
   let expireTimer = null;
   let idleArmed = false; // 双方入房后才开始闲置计时
+  let transferBusy = 0;  // >0 表示正在传文件，禁止闲置退出
   let maxTtlMinutes = 1440;
   let defaultTtlMinutes = 30;
   let isCreator = false;
@@ -67,7 +70,7 @@
   let pendingCreate = null; // { resolve, reject }
   let pendingJoin = null;
 
-  const CHUNK_SIZE = 256 * 1024; // 流式分块，避免整文件进内存
+  const CHUNK_SIZE = 64 * 1024; // 64KB 分块，中继/TURN 更稳
   const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB
   // 不再使用公网 STUN。ICE 服务器由 /api/config 下发（VPN 内 TURN）
   let ICE_SERVERS = [];
@@ -347,8 +350,41 @@
     return `无操作 ${sec}秒后退出`;
   }
 
+  function formatTtlLabel(minutes) {
+    const n = Number(minutes) || defaultTtlMinutes;
+    if (n >= 60 && n % 60 === 0) return n / 60 + ' 小时';
+    return n + ' 分钟';
+  }
+
+  function updateFooterTtl(minutes) {
+    if (roomTtlText) roomTtlText.textContent = formatTtlLabel(minutes);
+  }
+
   function setIdleHint(text) {
     if (roomExpireEl) roomExpireEl.textContent = text || '';
+  }
+
+  function formatEta(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return '估算中…';
+    if (sec < 5) return '即将完成';
+    if (sec < 60) return '约 ' + Math.ceil(sec) + ' 秒';
+    const m = Math.floor(sec / 60);
+    const s = Math.ceil(sec % 60);
+    return '约 ' + m + ' 分 ' + s + ' 秒';
+  }
+
+  function setTransferBusy(on, detail) {
+    transferBusy += on ? 1 : (transferBusy > 0 ? -1 : 0);
+    if (transferBusy < 0) transferBusy = 0;
+    if (transferBanner) {
+      if (transferBusy > 0) {
+        transferBanner.textContent = detail || '正在传输文件，请勿刷新或关闭页面。传完前房间不会因闲置退出。';
+        transferBanner.classList.remove('hidden');
+      } else {
+        transferBanner.classList.add('hidden');
+      }
+    }
+    if (transferBusy > 0) bumpIdle(true);
   }
 
   function bumpIdle(notifyServer) {
@@ -366,6 +402,11 @@
     if (expireTimer) clearInterval(expireTimer);
     expireTimer = setInterval(() => {
       if (!idleArmed || !idleUntil) return;
+      if (transferBusy > 0) {
+        bumpIdle(true);
+        setIdleHint('正在传文件，闲置倒计时已暂停');
+        return;
+      }
       const left = idleUntil - Date.now();
       setIdleHint(formatRemain(left));
       if (left <= 0) {
@@ -758,6 +799,8 @@
           .catch(console.error);
         break;
       case 'file-done':
+        bumpIdle(false);
+        assembleFile(msg.transferId, msg.hash);
         break;
       default:
         console.log('unknown', msg);
@@ -784,121 +827,169 @@
     }
     bumpIdle(true);
     for (const file of fileList) {
-      if (file.size > MAX_FILE_SIZE) {
-        addChat(`文件「${file.name}」超过 1GB 上限（当前 ${formatSize(file.size)}），已跳过。`, false);
-        continue;
-      }
-      if (file.size <= 0) {
-        addChat(`文件「${file.name}」为空，已跳过。`, false);
-        continue;
-      }
-      const transferId = crypto.randomUUID();
-      const total = Math.ceil(file.size / CHUNK_SIZE);
-      const chunkHashes = [];
-      const progressEl = document.createElement('div');
-      progressEl.className = 'progress-item';
-      progressEl.innerHTML = `
-        <div>发送: ${escapeHtml(file.name)} (${formatSize(file.size)})</div>
-        <div class="progress-bar"><div style="width:0%"></div></div>`;
-      fileProgress.appendChild(progressEl);
-      const bar = progressEl.querySelector('.progress-bar > div');
-
-      // 先流式读一遍算分块哈希，再流式发送（两次只保留当前块，不把整文件读进内存）
-      for (let i = 0; i < total; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const buf = await file.slice(start, end).arrayBuffer();
-        chunkHashes.push(await sha256(buf));
-      }
-      const hash = await sha256(new TextEncoder().encode(chunkHashes.join('')));
-
-      await sendAppMessage({
-        type: 'file-meta', transferId, name: file.name, size: file.size, hash,
-        chunks: total, hashMode: 'chunk-sha256'
-      });
-
-      for (let i = 0; i < total; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer());
-        const header = new TextEncoder().encode(JSON.stringify({ transferId, index: i, total }));
-        const headerLen = new Uint8Array(2);
-        new DataView(headerLen.buffer).setUint16(0, header.length);
-        const payload = new Uint8Array(2 + header.length + chunk.byteLength);
-        payload.set(headerLen, 0);
-        payload.set(header, 2);
-        payload.set(chunk, 2 + header.length);
-        const encrypted = await encryptBinary(payload);
-        if (dataChannel && dataChannel.readyState === 'open' && !useRelay) {
-          while (dataChannel.bufferedAmount > 2 * 1024 * 1024) {
-            await new Promise(r => setTimeout(r, 40));
-          }
-          dataChannel.send(encrypted);
-        } else {
-          const b64 = u8ToBase64(encrypted);
-          await sendAppMessage({ type: 'file-chunk', transferId, index: i, total, data: b64 });
+      try {
+        if (file.size > MAX_FILE_SIZE) {
+          addChat(`文件「${file.name}」超过 1GB 上限（当前 ${formatSize(file.size)}），已跳过。`, false);
+          continue;
         }
-        bar.style.width = Math.round(((i + 1) / total) * 100) + '%';
-        bumpIdle(false);
+        if (file.size <= 0) {
+          addChat(`文件「${file.name}」为空，已跳过。`, false);
+          continue;
+        }
+        const transferId = crypto.randomUUID();
+        const total = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+        const chunkHashes = [];
+        const progressEl = document.createElement('div');
+        progressEl.className = 'progress-item';
+        progressEl.innerHTML =
+          '<div>发送: ' + escapeHtml(file.name) + ' (' + formatSize(file.size) + ')</div>' +
+          '<div class="progress-bar"><div style="width:0%"></div></div>' +
+          '<div class="eta-text">正在估算剩余时间… 请勿刷新页面</div>';
+        fileProgress.appendChild(progressEl);
+        const bar = progressEl.querySelector('.progress-bar > div');
+        const etaEl = progressEl.querySelector('.eta-text');
+        setTransferBusy(true, '正在发送「' + file.name + '」，请勿刷新页面。');
+        const t0 = Date.now();
+
+        await sendAppMessage({
+          type: 'file-meta',
+          transferId,
+          name: file.name,
+          size: file.size,
+          chunks: total,
+          hashMode: 'chunk-sha256'
+        });
+
+        for (let i = 0; i < total; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer());
+          chunkHashes.push(await sha256(chunk));
+          const header = new TextEncoder().encode(JSON.stringify({ transferId, index: i, total }));
+          const packed = new Uint8Array(2 + header.length + chunk.byteLength);
+          new DataView(packed.buffer).setUint16(0, header.length);
+          packed.set(header, 2);
+          packed.set(chunk, 2 + header.length);
+          const encrypted = await encryptBinary(packed);
+          if (dataChannel && dataChannel.readyState === 'open' && !useRelay) {
+            while (dataChannel.bufferedAmount > 1024 * 1024) {
+              await new Promise(r => setTimeout(r, 30));
+            }
+            dataChannel.send(encrypted);
+          } else {
+            await sendAppMessage({
+              type: 'file-chunk',
+              transferId,
+              index: i,
+              total,
+              data: u8ToBase64(encrypted)
+            });
+          }
+          const pct = Math.round(((i + 1) / total) * 100);
+          bar.style.width = pct + '%';
+          const elapsed = (Date.now() - t0) / 1000;
+          const speed = elapsed > 0.2 ? ((i + 1) * CHUNK_SIZE) / elapsed : 0;
+          const remainBytes = file.size - (i + 1) * CHUNK_SIZE;
+          const etaSec = speed > 0 ? Math.max(0, remainBytes) / speed : 0;
+          if (etaEl) {
+            etaEl.textContent = pct >= 100
+              ? '发送完成，请勿刷新直至对方收完'
+              : ('已用 ' + formatEta(elapsed).replace('约 ', '') + ' · 剩余 ' + formatEta(etaSec) + ' · 请勿刷新页面');
+          }
+          bumpIdle(true);
+        }
+
+        const hash = await sha256(new TextEncoder().encode(chunkHashes.join('')));
+        await sendAppMessage({ type: 'file-done', transferId, hash });
+        progressEl.querySelector('div').textContent += ' ✓';
+        if (etaEl) etaEl.textContent = '已发送完成';
+      } catch (e) {
+        console.error('send file failed', e);
+        addChat('发送失败: ' + (e.message || e), false);
+      } finally {
+        setTransferBusy(false);
       }
-      await sendAppMessage({ type: 'file-done', transferId, hash });
-      progressEl.querySelector('div').textContent += ' ✓';
     }
   }
 
   function onFileMeta(msg) {
     if (msg.size > MAX_FILE_SIZE) {
-      addChat(`对方发送的文件「${msg.name || ''}」超过 1GB 上限，已拒绝。`, false);
+      addChat('对方发送的文件「' + (msg.name || '') + '」超过 1GB 上限，已拒绝。', false);
       return;
     }
     pendingFiles.set(msg.transferId, {
-      name: msg.name, size: msg.size, hash: msg.hash,
-      total: msg.chunks, parts: new Array(msg.chunks), hashes: new Array(msg.chunks),
-      received: 0, hashMode: msg.hashMode || 'chunk-sha256'
+      name: msg.name,
+      size: msg.size,
+      hash: msg.hash || '',
+      total: msg.chunks || 1,
+      parts: new Array(msg.chunks || 1),
+      hashes: new Array(msg.chunks || 1),
+      received: 0,
+      assembling: false
     });
     const el = document.createElement('div');
     el.className = 'progress-item';
-    el.id = `recv-${msg.transferId}`;
-    el.innerHTML = `
-      <div>接收: ${escapeHtml(msg.name)} (${formatSize(msg.size)})</div>
-      <div class="progress-bar"><div style="width:0%"></div></div>`;
+    el.id = 'recv-' + msg.transferId;
+    el.innerHTML =
+      '<div>接收: ' + escapeHtml(msg.name) + ' (' + formatSize(msg.size) + ')</div>' +
+      '<div class="progress-bar"><div style="width:0%"></div></div>' +
+      '<div class="eta-text">正在接收，请勿刷新页面…</div>';
     fileProgress.appendChild(el);
+    const rec = pendingFiles.get(msg.transferId);
+    if (rec) rec.startedAt = Date.now();
+    setTransferBusy(true, '正在接收「' + msg.name + '」，请勿刷新页面。');
   }
 
   function handleBinaryChunk(data) {
+    if (!(data instanceof Uint8Array)) data = new Uint8Array(data);
     const headerLen = new DataView(data.buffer, data.byteOffset, 2).getUint16(0);
-    const headerBytes = data.slice(2, 2 + headerLen);
-    const header = JSON.parse(new TextDecoder().decode(headerBytes));
-    const chunkData = data.slice(2 + headerLen);
+    const header = JSON.parse(new TextDecoder().decode(data.subarray(2, 2 + headerLen)));
+    const chunkData = data.slice(2 + headerLen); // copy，避免共享 buffer
     const info = pendingFiles.get(header.transferId);
-    if (!info) return;
-    if (info.parts[header.index]) return; // 防重复
+    if (!info) {
+      console.warn('[file] chunk before meta', header.transferId);
+      return;
+    }
+    if (info.parts[header.index]) return;
     info.parts[header.index] = new Blob([chunkData]);
     info.received++;
-    const el = document.getElementById(`recv-${header.transferId}`);
+    const el = document.getElementById('recv-' + header.transferId);
     if (el) {
-      el.querySelector('.progress-bar > div').style.width =
-        Math.round((info.received / info.total) * 100) + '%';
-    }
-    sha256(chunkData.buffer || chunkData).then((h) => {
-      if (!pendingFiles.has(header.transferId)) return;
-      info.hashes[header.index] = h;
-      const hashed = info.hashes.filter(Boolean).length;
-      if (hashed === info.total && info.received === info.total) {
-        assembleFile(header.transferId);
+      const pct = Math.round((info.received / info.total) * 100);
+      el.querySelector('.progress-bar > div').style.width = pct + '%';
+      const etaEl = el.querySelector('.eta-text');
+      if (etaEl && info.startedAt) {
+        const elapsed = (Date.now() - info.startedAt) / 1000;
+        const speed = elapsed > 0.2 ? (info.received * CHUNK_SIZE) / elapsed : 0;
+        const remain = Math.max(0, info.total - info.received) * CHUNK_SIZE;
+        const etaSec = speed > 0 ? remain / speed : 0;
+        etaEl.textContent = pct >= 100
+          ? '接收完成，正在校验…'
+          : ('剩余 ' + formatEta(etaSec) + ' · 请勿刷新页面');
       }
+    }
+    bumpIdle(true);
+    sha256(chunkData).then((h) => {
+      const cur = pendingFiles.get(header.transferId);
+      if (!cur) return;
+      cur.hashes[header.index] = h;
     }).catch(console.error);
   }
 
-  async function assembleFile(transferId) {
+  async function assembleFile(transferId, expectedHash) {
     const info = pendingFiles.get(transferId);
     if (!info || info.assembling) return;
-    if (info.hashes.filter(Boolean).length !== info.total) return;
     info.assembling = true;
     try {
+      if (info.received !== info.total) {
+        throw new Error('分块不完整 ' + info.received + '/' + info.total);
+      }
+      for (let i = 0; i < 50 && info.hashes.filter(Boolean).length < info.total; i++) {
+        await new Promise(r => setTimeout(r, 20));
+      }
       const hash = await sha256(new TextEncoder().encode(info.hashes.join('')));
-      if (hash !== info.hash) {
-        addChat(`文件 ${info.name} 校验失败！`, false);
+      if (expectedHash && hash !== expectedHash) {
+        addChat('文件 ' + info.name + ' 校验失败！', false);
         pendingFiles.delete(transferId);
         return;
       }
@@ -907,7 +998,7 @@
       const a = document.createElement('a');
       a.href = url;
       a.download = info.name;
-      a.textContent = `下载 ${info.name}`;
+      a.textContent = '下载 ' + info.name;
       a.className = 'btn secondary small';
       a.style.marginTop = '0.5rem';
       a.onclick = () => setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -915,14 +1006,17 @@
       item.className = 'received-item';
       item.appendChild(a);
       receivedFiles.appendChild(item);
-      const el = document.getElementById(`recv-${transferId}`);
+      const el = document.getElementById('recv-' + transferId);
       if (el) el.querySelector('div').textContent += ' ✓ 校验通过';
-      addChat(`收到文件: ${info.name}`, false);
+      addChat('收到文件: ' + info.name, false);
+      const etaEl = document.querySelector('#recv-' + transferId + ' .eta-text');
+      if (etaEl) etaEl.textContent = '已完成，可以下载';
     } catch (e) {
       console.error('assemble failed', e);
-      addChat(`文件 ${info.name} 组装失败`, false);
+      addChat('文件 ' + (info && info.name) + ' 组装失败', false);
     }
     pendingFiles.delete(transferId);
+    setTransferBusy(false);
   }
 
   function cleanupPeer() {
@@ -940,16 +1034,24 @@
     });
   });
 
+  function refreshLobbyTtlFooter() {
+    updateFooterTtl(readCreateTtlMinutes());
+  }
   if (createTtl) {
     createTtl.addEventListener('change', () => {
-      if (!createTtlCustom) return;
-      if (createTtl.value === 'custom') {
-        createTtlCustom.classList.remove('hidden');
-        createTtlCustom.focus();
-      } else {
-        createTtlCustom.classList.add('hidden');
+      if (createTtlCustom) {
+        if (createTtl.value === 'custom') {
+          createTtlCustom.classList.remove('hidden');
+          createTtlCustom.focus();
+        } else {
+          createTtlCustom.classList.add('hidden');
+        }
       }
+      refreshLobbyTtlFooter();
     });
+  }
+  if (createTtlCustom) {
+    createTtlCustom.addEventListener('input', refreshLobbyTtlFooter);
   }
 
   $('#btn-create').addEventListener('click', async () => {
@@ -988,7 +1090,8 @@
       createStatus.className = 'status ok';
       showSession(roomCode);
       idleMinutes = msg.idleMinutes || msg.ttlMinutes || defaultTtlMinutes;
-      setIdleHint(`等待对方加入；加入后无操作 ${idleMinutes} 分钟将退出`);
+      updateFooterTtl(idleMinutes);
+      setIdleHint('等待对方加入；加入后无操作 ' + idleMinutes + ' 分钟将退出');
       setConnStatus('等待对方加入…');
       console.log('[room] nameplate=', nameplate, '(password kept local)');
     } catch (e) {
@@ -1058,6 +1161,7 @@
 
       if (msg.nameplate) nameplate = msg.nameplate;
       idleMinutes = msg.idleMinutes || msg.ttlMinutes || defaultTtlMinutes;
+      updateFooterTtl(idleMinutes);
       joinStatus.textContent = '加入成功';
       joinStatus.className = 'status ok';
       showSession(roomCode);
@@ -1079,6 +1183,14 @@
   chatInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendChat();
   });
+  window.addEventListener('beforeunload', (e) => {
+    if (transferBusy > 0) {
+      e.preventDefault();
+      e.returnValue = '文件尚未传完，离开页面会中断传输。';
+      return e.returnValue;
+    }
+  });
+
   fileInput.addEventListener('change', (e) => {
     if (e.target.files.length) {
       sendFiles(Array.from(e.target.files));
@@ -1099,11 +1211,7 @@
       const cfg = await res.json();
       defaultTtlMinutes = cfg.roomTtlMinutes || 30;
       maxTtlMinutes = cfg.roomTtlMaxMinutes || 1440;
-      if (el) {
-        el.textContent = defaultTtlMinutes >= 60 && defaultTtlMinutes % 60 === 0
-          ? `${defaultTtlMinutes / 60} 小时`
-          : `${defaultTtlMinutes} 分钟`;
-      }
+      updateFooterTtl(defaultTtlMinutes);
       if (ttlHint) {
         ttlHint.textContent = `双方加入后，若没有聊天或传文件达到该时长将自动退出（默认 ${defaultTtlMinutes} 分钟，最长 ${maxTtlMinutes} 分钟）。有操作会重新计时。`;
       }
