@@ -15,6 +15,10 @@
   const roomCodeEl = $('#room-code');
   const createStatus = $('#create-status');
   const joinStatus = $('#join-status');
+  const createTtl = $('#create-ttl');
+  const createTtlCustom = $('#create-ttl-custom');
+  const ttlHint = $('#ttl-hint');
+  const roomExpireEl = $('#room-expire');
   const joinCodeInput = $('#join-code');
   const sessionCode = $('#session-code');
   const connStatus = $('#conn-status');
@@ -47,6 +51,12 @@
   let roomCode = null;       // 展示给用户的完整码 = nameplate-password（仅 UI / 复制）
   let nameplate = null;      // 服务端路由 ID（可被服务器知道）
   let pakePassword = null;   // SPAKE2 口令（仅本地，不发送给服务器）
+  let idleMinutes = 30;
+  let idleUntil = null;
+  let expireTimer = null;
+  let idleArmed = false; // 双方入房后才开始闲置计时
+  let maxTtlMinutes = 1440;
+  let defaultTtlMinutes = 30;
   let isCreator = false;
   let cryptoKey = null;
   let pc = null;
@@ -311,6 +321,66 @@
     return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
+
+  function readCreateTtlMinutes() {
+    const sel = createTtl ? createTtl.value : '30';
+    let n;
+    if (sel === 'custom') {
+      n = parseInt(createTtlCustom && createTtlCustom.value, 10);
+    } else {
+      n = parseInt(sel, 10);
+    }
+    if (!Number.isFinite(n) || n < 1) n = defaultTtlMinutes;
+    if (n > maxTtlMinutes) n = maxTtlMinutes;
+    return n;
+  }
+
+  function formatRemain(ms) {
+    if (ms <= 0) return '即将退出';
+    const s = Math.ceil(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `无操作 ${h}小时${m}分后退出`;
+    if (m > 0) return `无操作 ${m}分${sec}秒后退出`;
+    return `无操作 ${sec}秒后退出`;
+  }
+
+  function setIdleHint(text) {
+    if (roomExpireEl) roomExpireEl.textContent = text || '';
+  }
+
+  function bumpIdle(notifyServer) {
+    if (!idleArmed || !idleMinutes) return;
+    idleUntil = Date.now() + idleMinutes * 60 * 1000;
+    if (notifyServer !== false && ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify({ type: 'activity' })); } catch (_) {}
+    }
+  }
+
+  function armIdleTimer(minutes) {
+    if (minutes) idleMinutes = minutes;
+    idleArmed = true;
+    bumpIdle(true);
+    if (expireTimer) clearInterval(expireTimer);
+    expireTimer = setInterval(() => {
+      if (!idleArmed || !idleUntil) return;
+      const left = idleUntil - Date.now();
+      setIdleHint(formatRemain(left));
+      if (left <= 0) {
+        clearInterval(expireTimer);
+        expireTimer = null;
+        idleArmed = false;
+        addChat('长时间无聊天或传文件，已自动退出房间。', false);
+        if (ws && ws.readyState === 1) {
+          try { ws.send(JSON.stringify({ type: 'leave' })); } catch (_) {}
+        }
+        setTimeout(() => location.reload(), 800);
+      }
+    }, 1000);
+    setIdleHint(formatRemain(idleMinutes * 60 * 1000));
+  }
+
   function showSession(code) {
     lobby.classList.add('hidden');
     session.classList.remove('hidden');
@@ -442,6 +512,7 @@
       case 'peer-joined':
         setConnStatus('对端已加入，正在协商密钥…');
         addChat('对方已进入房间，开始 SPAKE2 密钥协商…', false);
+        armIdleTimer(idleMinutes);
         try {
           await runPAKE();
           await startWebRTC();
@@ -674,8 +745,10 @@
         break;
       case 'chat':
         addChat(msg.text, false);
+        bumpIdle(false);
         break;
       case 'file-meta':
+        bumpIdle(false);
         onFileMeta(msg);
         break;
       case 'file-chunk':
@@ -699,10 +772,12 @@
     if (!text) return;
     addChat(text, true);
     sendAppMessage({ type: 'chat', text });
+    bumpIdle(true);
     chatInput.value = '';
   }
 
   async function sendFiles(fileList) {
+    bumpIdle(true);
     for (const file of fileList) {
       const transferId = crypto.randomUUID();
       const arrayBuffer = await file.arrayBuffer();
@@ -828,6 +903,18 @@
     });
   });
 
+  if (createTtl) {
+    createTtl.addEventListener('change', () => {
+      if (!createTtlCustom) return;
+      if (createTtl.value === 'custom') {
+        createTtlCustom.classList.remove('hidden');
+        createTtlCustom.focus();
+      } else {
+        createTtlCustom.classList.add('hidden');
+      }
+    });
+  }
+
   $('#btn-create').addEventListener('click', async () => {
     if (!ensureCrypto()) {
       createStatus.textContent = '当前环境不支持加密（请用 HTTPS 访问）';
@@ -846,7 +933,8 @@
             pendingCreate = null;
           }
         }, 8000);
-        ws.send(JSON.stringify({ type: 'create-room' }));
+        const ttlMinutes = readCreateTtlMinutes();
+        ws.send(JSON.stringify({ type: 'create-room', ttlMinutes }));
       });
 
       // 服务端只给 nameplate；口令本地生成，永不上传
@@ -862,6 +950,8 @@
       createStatus.textContent = '房间已创建。请把完整房间码私下发给对方（服务器看不到口令部分）。';
       createStatus.className = 'status ok';
       showSession(roomCode);
+      idleMinutes = msg.idleMinutes || msg.ttlMinutes || defaultTtlMinutes;
+      setIdleHint(`等待对方加入；加入后无操作 ${idleMinutes} 分钟将退出`);
       setConnStatus('等待对方加入…');
       console.log('[room] nameplate=', nameplate, '(password kept local)');
     } catch (e) {
@@ -930,6 +1020,7 @@
       });
 
       if (msg.nameplate) nameplate = msg.nameplate;
+      idleMinutes = msg.idleMinutes || msg.ttlMinutes || defaultTtlMinutes;
       joinStatus.textContent = '加入成功';
       joinStatus.className = 'status ok';
       showSession(roomCode);
@@ -969,10 +1060,21 @@
     try {
       const res = await fetch('/api/config');
       const cfg = await res.json();
+      defaultTtlMinutes = cfg.roomTtlMinutes || 30;
+      maxTtlMinutes = cfg.roomTtlMaxMinutes || 1440;
       if (el) {
-        const m = cfg.roomTtlMinutes || 30;
-        el.textContent = m >= 60 && m % 60 === 0 ? `${m / 60} 小时` : `${m} 分钟`;
+        el.textContent = defaultTtlMinutes >= 60 && defaultTtlMinutes % 60 === 0
+          ? `${defaultTtlMinutes / 60} 小时`
+          : `${defaultTtlMinutes} 分钟`;
       }
+      if (ttlHint) {
+        ttlHint.textContent = `双方加入后，若没有聊天或传文件达到该时长将自动退出（默认 ${defaultTtlMinutes} 分钟，最长 ${maxTtlMinutes} 分钟）。有操作会重新计时。`;
+      }
+      if (createTtl) {
+        const opt = Array.from(createTtl.options).find(o => o.value === String(defaultTtlMinutes));
+        if (opt) createTtl.value = String(defaultTtlMinutes);
+      }
+      if (createTtlCustom) createTtlCustom.max = String(maxTtlMinutes);
       if (Array.isArray(cfg.iceServers) && cfg.iceServers.length) {
         ICE_SERVERS = cfg.iceServers;
         console.log('[ice] TURN enabled', cfg.turnHost + ':' + cfg.turnPort);

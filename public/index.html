@@ -22,6 +22,19 @@
 
       <div id="create-panel" class="panel active">
         <p>点击下方生成完整房间码（名牌由服务器分配，口令在本地生成）。请通过电话/当面把<strong>完整码</strong>告诉对方；服务器只看到名牌，看不到口令。</p>
+        <label class="ttl-label" for="create-ttl">无操作自动退出</label>
+        <div class="ttl-row">
+          <select id="create-ttl">
+            <option value="5">5 分钟</option>
+            <option value="10">10 分钟</option>
+            <option value="30" selected>30 分钟</option>
+            <option value="60">1 小时</option>
+            <option value="120">2 小时</option>
+            <option value="custom">自定义…</option>
+          </select>
+          <input id="create-ttl-custom" type="number" min="1" max="1440" placeholder="分钟" class="hidden" />
+        </div>
+        <p class="hint" id="ttl-hint">双方进入房间后，若一直没有聊天或传文件，达到该时长将自动退出。有操作会重新计时。</p>
         <button id="btn-create" class="btn primary">生成房间码</button>
         <div id="code-display" class="code-box hidden">
           <span id="room-code"></span>
@@ -44,6 +57,7 @@
         <div>
           <strong>房间码：</strong><span id="session-code"></span>
           <span id="conn-status" class="badge">连接中…</span>
+          <span id="room-expire" class="expire-hint"></span>
         </div>
         <button id="btn-leave" class="btn danger small">离开房间</button>
       </div>

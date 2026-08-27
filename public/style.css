@@ -405,3 +405,38 @@ footer {
   font-size: 0.85rem;
   margin-top: 1rem;
 }
+
+
+.ttl-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 1rem 0 0.4rem;
+}
+.ttl-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.ttl-row select,
+.ttl-row input[type="number"] {
+  flex: 1;
+  padding: 0.65rem 0.85rem;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.95rem;
+  margin-bottom: 0;
+}
+.hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 1rem;
+}
+.expire-hint {
+  display: inline-block;
+  margin-left: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}

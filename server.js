@@ -16,7 +16,14 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 3080;
 // 房间过期时间（分钟）。部署时设置，例如：ROOM_TTL_MINUTES=5 npm start
 const ROOM_TTL_MINUTES = Math.max(1, parseInt(process.env.ROOM_TTL_MINUTES || '30', 10) || 30);
+const ROOM_TTL_MAX_MINUTES = Math.max(ROOM_TTL_MINUTES, parseInt(process.env.ROOM_TTL_MAX_MINUTES || '1440', 10) || 1440);
 const ROOM_TTL_MS = ROOM_TTL_MINUTES * 60 * 1000;
+
+function clampTtlMinutes(raw) {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return ROOM_TTL_MINUTES;
+  return Math.min(n, ROOM_TTL_MAX_MINUTES);
+}
 // 限速：VPN 出口常为同一源 IP（SNAT），失败次数按 nameplate 计，IP 只做宽松防洪
 const JOIN_RATE_WINDOW_MS = Math.max(10, parseInt(process.env.JOIN_RATE_WINDOW_SEC || '60', 10) || 60) * 1000;
 const JOIN_MAX_FAILS_PER_NAMEPLATE = Math.max(3, parseInt(process.env.JOIN_MAX_FAILS || '8', 10) || 8);
@@ -134,18 +141,38 @@ function getIceServers() {
   ];
 }
 
+function touchRoom(room) {
+  if (room) room.lastActivity = Date.now();
+}
+
+function roomShouldExpire(room, now) {
+  const ttl = room.ttlMs || ROOM_TTL_MS;
+  const n = room.clients.size;
+  if (n >= 2) {
+    // 双方已加入：按最后一次业务活动（聊天/传文件/心跳）计算闲置
+    const last = room.lastActivity || room.pairedAt || room.createdAt;
+    return now - last > ttl;
+  }
+  // 仍在等待对方：从创建起算，避免空房间一直占用
+  return now - room.createdAt > ttl;
+}
+
+function expireRoom(code, room, reason) {
+  for (const ws of room.clients.keys()) {
+    try {
+      ws.send(JSON.stringify({ type: 'room-expired', reason: reason || 'idle' }));
+      ws.close();
+    } catch (_) {}
+  }
+  rooms.delete(code);
+  console.log('[room] expired', code, reason || '');
+}
+
 function cleanRooms() {
   const now = Date.now();
   for (const [code, room] of rooms) {
-    if (now - room.createdAt > ROOM_TTL_MS) {
-      for (const ws of room.clients.keys()) {
-        try {
-          ws.send(JSON.stringify({ type: 'room-expired' }));
-          ws.close();
-        } catch (_) {}
-      }
-      rooms.delete(code);
-      console.log('[room] expired', code);
+    if (roomShouldExpire(room, now)) {
+      expireRoom(code, room, room.clients.size >= 2 ? 'idle' : 'waiting');
     }
   }
 }
@@ -261,6 +288,7 @@ function createAppHandler() {
         rooms: rooms.size,
         uptime: Math.floor(process.uptime()),
         roomTtlMinutes: ROOM_TTL_MINUTES,
+        roomTtlMaxMinutes: ROOM_TTL_MAX_MINUTES,
         roomTtlMs: ROOM_TTL_MS,
         joinMaxFailsPerNameplate: JOIN_MAX_FAILS_PER_NAMEPLATE,
         joinMaxAttemptsPerIp: JOIN_MAX_ATTEMPTS_PER_IP,
@@ -283,7 +311,7 @@ function createAppHandler() {
           nameplate: code,
           members: room.clients.size,
           ageSec,
-          remainSec: Math.max(0, Math.floor((ROOM_TTL_MS - (now - room.createdAt)) / 1000))
+          remainSec: Math.max(0, Math.floor(((room.ttlMs || ROOM_TTL_MS) - (now - (room.lastActivity || room.createdAt))) / 1000))
         });
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -326,13 +354,21 @@ function attachWebSocket(server) {
             return;
           }
           // 只返回 nameplate；口令由客户端本地生成，服务端永不接收
+          const ttlMinutes = clampTtlMinutes(msg.ttlMinutes);
+          const ttlMs = ttlMinutes * 60 * 1000;
+          const createdAt = Date.now();
           const nameplate = generateNameplate();
-          const room = { clients: new Map(), createdAt: Date.now() };
-          room.clients.set(ws, { role: 'creator', joinedAt: Date.now() });
+          const room = { clients: new Map(), createdAt, ttlMs, ttlMinutes, lastActivity: createdAt, pairedAt: 0 };
+          room.clients.set(ws, { role: 'creator', joinedAt: createdAt });
           rooms.set(nameplate, room);
           ws.roomCode = nameplate; // 内部仅存 nameplate
-          ws.send(JSON.stringify({ type: 'room-created', nameplate }));
-          console.log('[room] created nameplate=', nameplate, 'ip=', ws.clientIp);
+          ws.send(JSON.stringify({
+            type: 'room-created',
+            nameplate,
+            ttlMinutes,
+            idleMinutes: ttlMinutes
+          }));
+          console.log('[room] created nameplate=', nameplate, 'ttl=', ttlMinutes, 'min', 'ip=', ws.clientIp);
           break;
         }
 
@@ -363,8 +399,17 @@ function attachWebSocket(server) {
           }
           noteJoinSuccess(ws.clientIp);
           room.clients.set(ws, { role: 'joiner', joinedAt: Date.now() });
+          if (room.clients.size >= 2) {
+            room.pairedAt = Date.now();
+            room.lastActivity = Date.now();
+          }
           ws.roomCode = np;
-          ws.send(JSON.stringify({ type: 'room-joined', nameplate: np }));
+          ws.send(JSON.stringify({
+            type: 'room-joined',
+            nameplate: np,
+            ttlMinutes: room.ttlMinutes || ROOM_TTL_MINUTES,
+            idleMinutes: room.ttlMinutes || ROOM_TTL_MINUTES
+          }));
 
           for (const [client] of room.clients) {
             if (client.readyState === 1) {
@@ -375,6 +420,14 @@ function attachWebSocket(server) {
           break;
         }
 
+        case 'activity': {
+          const code = ws.roomCode;
+          if (!code) return;
+          const room = rooms.get(code);
+          if (room) touchRoom(room);
+          break;
+        }
+
         case 'signal':
         case 'relay-data':
         case 'pake': {
@@ -382,6 +435,7 @@ function attachWebSocket(server) {
           if (!code) return;
           const room = rooms.get(code);
           if (!room) return;
+          touchRoom(room);
           for (const [client] of room.clients) {
             if (client !== ws && client.readyState === 1) {
               client.send(JSON.stringify({
@@ -446,7 +500,7 @@ httpsServer.listen(PORT, '0.0.0.0', () => {
   console.log('────────────────────────────────────────');
   console.log(`  本机访问:     https://127.0.0.1:${PORT}`);
   console.log(`  局域网访问:   https://<服务器IP>:${PORT}`);
-  console.log(`  房间过期:     ${ROOM_TTL_MINUTES} 分钟  (环境变量 ROOM_TTL_MINUTES)`);
+  console.log(`  房间过期:     默认 ${ROOM_TTL_MINUTES} 分钟，最大 ${ROOM_TTL_MAX_MINUTES} 分钟`);
   if (TURN_PASS) {
     console.log(`  TURN:         turn:${TURN_HOST}:${TURN_PORT}  user=${TURN_USER}`);
   } else {
