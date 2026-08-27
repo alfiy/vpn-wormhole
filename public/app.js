@@ -78,12 +78,12 @@
 
   // 口令词表（仅客户端使用，服务端无此逻辑）
   const PAKE_WORDS = [
-    'apple','brave','cloud','delta','eagle','flame','grape','harbor',
-    'ivory','jade','kite','lemon','maple','noble','ocean','pearl',
-    'quartz','river','stone','tiger','umbra','vivid','whale','xenon',
-    'yellow','zebra','amber','blaze','coral','dawn','ember','frost',
-    'glow','haven','iris','jewel','karma','lunar','mist','nova',
-    'orbit','prism','quest','raven','solar','thunder','ultra','vortex'
+    '青山','流水','白云','明月','清风','星河','秋水','春山',
+    '竹林','松涛','梅花','兰草','菊花','莲叶','梧桐','杨柳',
+    '石桥','渔舟','江雪','塞北','江南','雁门','天山','东海',
+    '赤壁','玉门','长安','洛阳','钱塘','洞庭','昆仑','太行',
+    '晨光','暮色','霜叶','雪原','谷雨','惊蛰','白露','小满',
+    '琥珀','青瓷','锦书','玉盘','金风','银汉','丹霞','翠峰'
   ];
 
   /** 客户端本地生成高熵口令（不经过服务器） */
@@ -98,7 +98,7 @@
 
   /**
    * 解析用户输入的完整房间码
-   * 格式: {nameplate}-{password...}  例如 4821-brave-pearl-a1b2c3
+   * 格式: {nameplate}-{password...}  例如 4821-青山-流水-a1b2c3
    */
   function parseDisplayCode(full) {
     const raw = (full || '').trim().toLowerCase();
