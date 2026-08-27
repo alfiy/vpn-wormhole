@@ -67,7 +67,8 @@
   let pendingCreate = null; // { resolve, reject }
   let pendingJoin = null;
 
-  const CHUNK_SIZE = 32 * 1024;
+  const CHUNK_SIZE = 256 * 1024; // 流式分块，避免整文件进内存
+  const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB
   // 不再使用公网 STUN。ICE 服务器由 /api/config 下发（VPN 内 TURN）
   let ICE_SERVERS = [];
   let relayReady = false;
@@ -777,11 +778,23 @@
   }
 
   async function sendFiles(fileList) {
+    if (!keyConfirmed) {
+      addChat('密钥尚未确认，无法发送文件。', false);
+      return;
+    }
     bumpIdle(true);
     for (const file of fileList) {
+      if (file.size > MAX_FILE_SIZE) {
+        addChat(`文件「${file.name}」超过 1GB 上限（当前 ${formatSize(file.size)}），已跳过。`, false);
+        continue;
+      }
+      if (file.size <= 0) {
+        addChat(`文件「${file.name}」为空，已跳过。`, false);
+        continue;
+      }
       const transferId = crypto.randomUUID();
-      const arrayBuffer = await file.arrayBuffer();
-      const hash = await sha256(arrayBuffer);
+      const total = Math.ceil(file.size / CHUNK_SIZE);
+      const chunkHashes = [];
       const progressEl = document.createElement('div');
       progressEl.className = 'progress-item';
       progressEl.innerHTML = `
@@ -789,22 +802,32 @@
         <div class="progress-bar"><div style="width:0%"></div></div>`;
       fileProgress.appendChild(progressEl);
       const bar = progressEl.querySelector('.progress-bar > div');
-      await sendAppMessage({
-        type: 'file-meta', transferId, name: file.name, size: file.size, hash,
-        chunks: Math.ceil(file.size / CHUNK_SIZE)
-      });
-      const total = Math.ceil(file.size / CHUNK_SIZE);
+
+      // 先流式读一遍算分块哈希，再流式发送（两次只保留当前块，不把整文件读进内存）
       for (let i = 0; i < total; i++) {
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunk = arrayBuffer.slice(start, end);
+        const buf = await file.slice(start, end).arrayBuffer();
+        chunkHashes.push(await sha256(buf));
+      }
+      const hash = await sha256(new TextEncoder().encode(chunkHashes.join('')));
+
+      await sendAppMessage({
+        type: 'file-meta', transferId, name: file.name, size: file.size, hash,
+        chunks: total, hashMode: 'chunk-sha256'
+      });
+
+      for (let i = 0; i < total; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer());
         const header = new TextEncoder().encode(JSON.stringify({ transferId, index: i, total }));
         const headerLen = new Uint8Array(2);
         new DataView(headerLen.buffer).setUint16(0, header.length);
         const payload = new Uint8Array(2 + header.length + chunk.byteLength);
         payload.set(headerLen, 0);
         payload.set(header, 2);
-        payload.set(new Uint8Array(chunk), 2 + header.length);
+        payload.set(chunk, 2 + header.length);
         const encrypted = await encryptBinary(payload);
         if (dataChannel && dataChannel.readyState === 'open' && !useRelay) {
           while (dataChannel.bufferedAmount > 2 * 1024 * 1024) {
@@ -816,6 +839,7 @@
           await sendAppMessage({ type: 'file-chunk', transferId, index: i, total, data: b64 });
         }
         bar.style.width = Math.round(((i + 1) / total) * 100) + '%';
+        bumpIdle(false);
       }
       await sendAppMessage({ type: 'file-done', transferId, hash });
       progressEl.querySelector('div').textContent += ' ✓';
@@ -823,9 +847,14 @@
   }
 
   function onFileMeta(msg) {
+    if (msg.size > MAX_FILE_SIZE) {
+      addChat(`对方发送的文件「${msg.name || ''}」超过 1GB 上限，已拒绝。`, false);
+      return;
+    }
     pendingFiles.set(msg.transferId, {
       name: msg.name, size: msg.size, hash: msg.hash,
-      total: msg.chunks, chunks: new Array(msg.chunks), received: 0
+      total: msg.chunks, parts: new Array(msg.chunks), hashes: new Array(msg.chunks),
+      received: 0, hashMode: msg.hashMode || 'chunk-sha256'
     });
     const el = document.createElement('div');
     el.className = 'progress-item';
@@ -843,49 +872,57 @@
     const chunkData = data.slice(2 + headerLen);
     const info = pendingFiles.get(header.transferId);
     if (!info) return;
-    info.chunks[header.index] = chunkData;
+    if (info.parts[header.index]) return; // 防重复
+    info.parts[header.index] = new Blob([chunkData]);
     info.received++;
     const el = document.getElementById(`recv-${header.transferId}`);
     if (el) {
       el.querySelector('.progress-bar > div').style.width =
         Math.round((info.received / info.total) * 100) + '%';
     }
-    if (info.received === info.total) assembleFile(header.transferId);
+    sha256(chunkData.buffer || chunkData).then((h) => {
+      if (!pendingFiles.has(header.transferId)) return;
+      info.hashes[header.index] = h;
+      const hashed = info.hashes.filter(Boolean).length;
+      if (hashed === info.total && info.received === info.total) {
+        assembleFile(header.transferId);
+      }
+    }).catch(console.error);
   }
 
   async function assembleFile(transferId) {
     const info = pendingFiles.get(transferId);
-    if (!info) return;
-    let totalLen = 0;
-    for (const c of info.chunks) totalLen += c.byteLength;
-    const full = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const c of info.chunks) {
-      full.set(c, offset);
-      offset += c.byteLength;
+    if (!info || info.assembling) return;
+    if (info.hashes.filter(Boolean).length !== info.total) return;
+    info.assembling = true;
+    try {
+      const hash = await sha256(new TextEncoder().encode(info.hashes.join('')));
+      if (hash !== info.hash) {
+        addChat(`文件 ${info.name} 校验失败！`, false);
+        pendingFiles.delete(transferId);
+        return;
+      }
+      const blob = new Blob(info.parts);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = info.name;
+      a.textContent = `下载 ${info.name}`;
+      a.className = 'btn secondary small';
+      a.style.marginTop = '0.5rem';
+      a.onclick = () => setTimeout(() => URL.revokeObjectURL(url), 60000);
+      const item = document.createElement('div');
+      item.className = 'received-item';
+      item.appendChild(a);
+      receivedFiles.appendChild(item);
+      const el = document.getElementById(`recv-${transferId}`);
+      if (el) el.querySelector('div').textContent += ' ✓ 校验通过';
+      addChat(`收到文件: ${info.name}`, false);
+    } catch (e) {
+      console.error('assemble failed', e);
+      addChat(`文件 ${info.name} 组装失败`, false);
     }
-    const hash = await sha256(full.buffer);
-    if (hash !== info.hash) {
-      addChat(`文件 ${info.name} 校验失败！`, false);
-      return;
-    }
-    const blob = new Blob([full]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = info.name;
-    a.textContent = `下载 ${info.name}`;
-    a.className = 'btn secondary small';
-    a.style.marginTop = '0.5rem';
-    a.onclick = () => setTimeout(() => URL.revokeObjectURL(url), 15000);
-    const item = document.createElement('div');
-    item.className = 'received-item';
-    item.appendChild(a);
-    receivedFiles.appendChild(item);
-    const el = document.getElementById(`recv-${transferId}`);
-    if (el) el.querySelector('div').textContent += ' ✓ 校验通过';
     pendingFiles.delete(transferId);
-    addChat(`收到文件: ${info.name}`, false);
   }
 
   function cleanupPeer() {
